@@ -1,0 +1,53 @@
+[package]
+name = "dvrreview"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Web framework
+axum = { version = "0.8", features = ["macros"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["fs", "cors"] }
+
+# Database
+diesel = { version = "2.2", features = ["postgres", "uuid", "chrono", "serde_json"] }
+diesel-async = { version = "0.5", features = ["postgres", "deadpool"] }
+deadpool = "0.12"
+futures-util = { version = "0.3", features = ["alloc"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Utilities
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "2"
+anyhow = "1"
+dotenvy = "0.15"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Image processing
+image = "0.25"
+img_hash = "3"
+tempfile = "3"
+
+# Text processing
+regex-lite = "0.1"
+
+# Filesystem
+walkdir = "2"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Templates
+askama = "0.12"
+askama_axum = "0.4"
+
+[dev-dependencies]
+tokio-test = "0.4"

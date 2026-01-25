@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DVR Review</title>
+    <style>
+        body {
+            font-family: system-ui, -apple-system, sans-serif;
+            max-width: 800px;
+            margin: 2rem auto;
+            padding: 0 1rem;
+            background: #1a1a1a;
+            color: #e0e0e0;
+        }
+        h1 { margin-bottom: 2rem; }
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 1rem;
+            margin-bottom: 2rem;
+        }
+        .stat {
+            background: #2a2a2a;
+            padding: 1.5rem;
+            border-radius: 8px;
+        }
+        .stat-value {
+            font-size: 2rem;
+            font-weight: bold;
+            color: #4a9eff;
+        }
+        .stat-label {
+            color: #888;
+            margin-top: 0.5rem;
+        }
+        a.button {
+            display: inline-block;
+            background: #4a9eff;
+            color: white;
+            padding: 1rem 2rem;
+            text-decoration: none;
+            border-radius: 8px;
+            font-weight: bold;
+        }
+        a.button:hover {
+            background: #3a8eef;
+        }
+    </style>
+</head>
+<body>
+    <h1>DVR Review</h1>
+
+    <div class="stats">
+        <div class="stat">
+            <div class="stat-value">{{ pending_clusters }}</div>
+            <div class="stat-label">Clusters to review</div>
+        </div>
+        <div class="stat">
+            <div class="stat-value">{{ total_files }}</div>
+            <div class="stat-label">Total files</div>
+        </div>
+        <div class="stat">
+            <div class="stat-value">{{ reviewed_count }}</div>
+            <div class="stat-label">Reviews completed</div>
+        </div>
+    </div>
+
+    {% if pending_clusters > 0 %}
+    <a href="/review" class="button">Start Reviewing</a>
+    {% else %}
+    <p>No clusters to review. Run a scan to find duplicates.</p>
+    {% endif %}
+</body>
+</html>

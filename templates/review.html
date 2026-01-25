@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Review Cluster</title>
+    <style>
+        body {
+            font-family: system-ui, -apple-system, sans-serif;
+            margin: 0;
+            padding: 1rem;
+            background: #1a1a1a;
+            color: #e0e0e0;
+        }
+        h1 { margin-bottom: 0.5rem; }
+        .cluster-name { color: #888; margin-bottom: 2rem; }
+        .files { display: flex; flex-direction: column; gap: 2rem; }
+        .file-card { background: #2a2a2a; border-radius: 8px; padding: 1.5rem; }
+        .file-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 1rem; }
+        .file-info h3 { margin: 0 0 0.5rem 0; word-break: break-all; }
+        .file-meta { color: #888; font-size: 0.9rem; }
+        .file-meta span { margin-right: 1rem; }
+        .quality-badge { background: #4a9eff; color: white; padding: 0.25rem 0.75rem; border-radius: 4px; font-weight: bold; white-space: nowrap; }
+        .thumbnails { display: flex; gap: 0.5rem; overflow-x: auto; padding: 0.5rem 0; }
+        .thumbnail { flex-shrink: 0; cursor: pointer; position: relative; }
+        .thumbnail img { height: 120px; border-radius: 4px; border: 2px solid transparent; }
+        .thumbnail:hover img { border-color: #4a9eff; }
+        .thumbnail.selected img { border-color: #4aff4a; }
+        .thumbnail .timestamp { position: absolute; bottom: 4px; right: 4px; background: rgba(0,0,0,0.7); padding: 2px 6px; border-radius: 2px; font-size: 0.75rem; }
+        .file-actions { display: flex; gap: 0.5rem; margin-top: 1rem; }
+        button, .btn { padding: 0.75rem 1.5rem; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; text-decoration: none; display: inline-block; }
+        .btn-keep { background: #4aff4a; color: #1a1a1a; }
+        .btn-skip { background: #666; color: white; }
+        .btn-play { background: #4a9eff; color: white; }
+        button:hover, .btn:hover { opacity: 0.9; }
+        .bounds-controls { margin-top: 1rem; padding-top: 1rem; border-top: 1px solid #444; }
+        .bounds-controls label { display: block; margin-bottom: 0.5rem; color: #888; }
+        .bounds-row { display: flex; gap: 1rem; align-items: center; }
+        .bounds-row span { color: #888; }
+        video { max-width: 100%; margin-top: 1rem; border-radius: 4px; display: none; }
+        video.visible { display: block; }
+    </style>
+</head>
+<body>
+    <h1>Review Cluster</h1>
+    <p class="cluster-name">{% match cluster.name %}{% when Some with (name) %}{{ name }}{% when None %}Unnamed Cluster{% endmatch %} ({{ files.len() }} files)</p>
+
+    <div class="files">
+        {% for f in files %}
+        <div class="file-card" data-file-id="{{ f.file.id }}">
+            <div class="file-header">
+                <div class="file-info">
+                    <h3>{{ f.filename }}</h3>
+                    <div class="file-meta">
+                        {% if !f.resolution.is_empty() %}<span>{{ f.resolution }}</span>{% endif %}
+                        {% if !f.bitrate_kbps.is_empty() %}<span>{{ f.bitrate_kbps }}</span>{% endif %}
+                        <span>{{ f.size_mb }} MB</span>
+                        {% if !f.duration_display.is_empty() %}<span>{{ f.duration_display }}</span>{% endif %}
+                    </div>
+                </div>
+                {% if loop.first %}
+                <span class="quality-badge">Best Quality</span>
+                {% endif %}
+            </div>
+
+            <div class="thumbnails">
+                {% for thumb in f.thumbnails %}
+                <div class="thumbnail" data-timestamp="{{ thumb.timestamp_ms }}" onclick="selectThumbnail(this, '{{ f.file.id }}')">
+                    <img src="/thumbnails/{{ thumb.filename }}" alt="Frame at {{ thumb.timestamp_ms }}ms">
+                    <span class="timestamp">{{ thumb.timestamp_secs }}s</span>
+                </div>
+                {% endfor %}
+            </div>
+
+            <video id="video-{{ f.file.id }}" controls preload="none">
+                <source src="/media/{{ f.relative_path }}" type="video/mp4">
+            </video>
+
+            <div class="file-actions">
+                <form method="post" action="/review/{{ cluster.id }}/decide" style="display:inline;">
+                    <input type="hidden" name="kept_file_id" value="{{ f.file.id }}">
+                    <button type="submit" class="btn-keep">Keep</button>
+                </form>
+                <button class="btn-play" onclick="toggleVideo('{{ f.file.id }}')">Play</button>
+            </div>
+
+            <div class="bounds-controls">
+                <label>Content bounds (click thumbnails to set)</label>
+                <div class="bounds-row">
+                    <span>Start:</span>
+                    <input type="number" id="start-{{ f.file.id }}" placeholder="auto" style="width:100px">
+                    <span>End:</span>
+                    <input type="number" id="end-{{ f.file.id }}" placeholder="auto" style="width:100px">
+                    <button onclick="saveBounds('{{ f.file.id }}')" class="btn-skip">Save Bounds</button>
+                </div>
+            </div>
+        </div>
+        {% endfor %}
+    </div>
+
+    <div style="margin-top: 2rem; padding-top: 2rem; border-top: 1px solid #444;">
+        <form method="post" action="/review/{{ cluster.id }}/skip">
+            <button type="submit" class="btn-skip">Skip (Different Thumbnails)</button>
+        </form>
+    </div>
+
+    <script>
+        let selectedStart = {};
+        let selectedEnd = {};
+
+        function selectThumbnail(el, fileId) {
+            const timestamp = parseInt(el.dataset.timestamp);
+            const isShift = event.shiftKey;
+
+            if (isShift) {
+                selectedEnd[fileId] = timestamp;
+                document.getElementById('end-' + fileId).value = timestamp;
+            } else {
+                selectedStart[fileId] = timestamp;
+                document.getElementById('start-' + fileId).value = timestamp;
+            }
+
+            const card = el.closest('.file-card');
+            card.querySelectorAll('.thumbnail').forEach(t => t.classList.remove('selected'));
+            el.classList.add('selected');
+        }
+
+        function toggleVideo(fileId) {
+            const video = document.getElementById('video-' + fileId);
+            video.classList.toggle('visible');
+            if (video.classList.contains('visible')) {
+                video.play();
+            } else {
+                video.pause();
+            }
+        }
+
+        function saveBounds(fileId) {
+            const start = document.getElementById('start-' + fileId).value || null;
+            const end = document.getElementById('end-' + fileId).value || null;
+
+            fetch('/file/' + fileId + '/set-bounds', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                body: 'content_start_ms=' + (start || '') + '&content_end_ms=' + (end || '')
+            });
+        }
+    </script>
+</body>
+</html>

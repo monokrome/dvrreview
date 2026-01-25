@@ -1,0 +1,29 @@
+{
+  "src/*.rs": {
+    "alternate": "src/{}_test.rs",
+    "type": "source"
+  },
+  "src/**/mod.rs": {
+    "type": "module"
+  },
+  "src/db/models.rs": {
+    "alternate": "src/db/schema.rs"
+  },
+  "src/db/schema.rs": {
+    "alternate": "src/db/models.rs"
+  },
+  "src/web/routes.rs": {
+    "alternate": "src/web/templates/*.html"
+  },
+  "src/web/templates/*.html": {
+    "alternate": "src/web/routes.rs",
+    "type": "template"
+  },
+  "migrations/**/up.sql": {
+    "alternate": "migrations/{}/down.sql",
+    "type": "migration"
+  },
+  "migrations/**/down.sql": {
+    "alternate": "migrations/{}/up.sql"
+  }
+}
