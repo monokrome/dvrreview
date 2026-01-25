@@ -42,6 +42,10 @@ diesel::table! {
         status -> Text,
         created_at -> Timestamptz,
         fingerprinted_at -> Nullable<Timestamptz>,
+        transcoded_path -> Nullable<Text>,
+        transcoded_at -> Nullable<Timestamptz>,
+        original_size_bytes -> Nullable<Int8>,
+        transcode_status -> Text,
     }
 }
 

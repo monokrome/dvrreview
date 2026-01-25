@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
-use dvrreview::db::models::{File, NewCluster, NewClusterMember, NewFile, NewFingerprint, NewThumbnail};
+use dvrreview::db::models::{File, NewCluster, NewClusterMember, NewFile, NewFingerprint, NewThumbnail, TranscodeStatus};
 use dvrreview::db::schema::{cluster_members, clusters, files, fingerprints, thumbnails};
 use dvrreview::db::{self, DbPool};
 use dvrreview::scanner::fingerprint::{generate_sample_timestamps, generate_thumbnail_timestamps, Fingerprinter};
@@ -81,6 +81,33 @@ enum Command {
 
     /// Show statistics
     Stats,
+
+    /// Transcode files to H.265/HEVC for space savings
+    Transcode {
+        /// CRF value (0-51, lower = better quality, default 23)
+        #[arg(long, default_value = "23")]
+        crf: u8,
+
+        /// Encoding preset (ultrafast, fast, medium, slow, veryslow)
+        #[arg(long, default_value = "medium")]
+        preset: String,
+
+        /// Use hardware encoding if available (NVENC, VAAPI, QSV)
+        #[arg(long)]
+        hardware: bool,
+
+        /// Only transcode files with status 'kept'
+        #[arg(long)]
+        kept_only: bool,
+
+        /// Maximum number of files to transcode (useful for testing)
+        #[arg(long)]
+        limit: Option<usize>,
+
+        /// Skip verification (not recommended)
+        #[arg(long)]
+        no_verify: bool,
+    },
 }
 
 #[tokio::main]
@@ -113,6 +140,16 @@ async fn main() -> Result<()> {
         }
         Command::Stats => {
             show_stats(&pool).await?;
+        }
+        Command::Transcode {
+            crf,
+            preset,
+            hardware,
+            kept_only,
+            limit,
+            no_verify,
+        } => {
+            transcode_files(&pool, crf, preset, hardware, kept_only, limit, !no_verify).await?;
         }
     }
 
@@ -450,10 +487,260 @@ async fn show_stats(pool: &DbPool) -> Result<()> {
         .get_result(&mut conn)
         .await?;
 
-    println!("Total files:    {}", total_files);
-    println!("Fingerprinted:  {}", fingerprinted);
-    println!("Clusters:       {}", total_clusters);
-    println!("Reviews:        {}", reviewed);
+    // Transcode stats
+    let transcoded: i64 = files::table
+        .filter(files::transcode_status.eq(TranscodeStatus::Completed))
+        .count()
+        .get_result(&mut conn)
+        .await?;
+
+    let pending_transcode: i64 = files::table
+        .filter(files::transcode_status.eq(TranscodeStatus::Pending))
+        .count()
+        .get_result(&mut conn)
+        .await?;
+
+    let failed_transcode: i64 = files::table
+        .filter(files::transcode_status.eq(TranscodeStatus::Failed))
+        .count()
+        .get_result(&mut conn)
+        .await?;
+
+    // Calculate space savings
+    let transcoded_files: Vec<File> = files::table
+        .filter(files::transcode_status.eq(TranscodeStatus::Completed))
+        .filter(files::original_size_bytes.is_not_null())
+        .load(&mut conn)
+        .await?;
+
+    let savings: i64 = transcoded_files
+        .iter()
+        .map(|f| f.original_size_bytes.unwrap_or(0) - f.size_bytes)
+        .sum();
+
+    let all_files: Vec<File> = files::table.load(&mut conn).await?;
+    let current_size: i64 = all_files.iter().map(|f| f.size_bytes).sum();
+
+    println!("Files");
+    println!("  Total:        {}", total_files);
+    println!("  Fingerprinted:{}", fingerprinted);
+    println!();
+    println!("Dedup");
+    println!("  Clusters:     {}", total_clusters);
+    println!("  Reviews:      {}", reviewed);
+    println!();
+    println!("Transcode");
+    println!("  Completed:    {}", transcoded);
+    println!("  Pending:      {}", pending_transcode);
+    println!("  Failed:       {}", failed_transcode);
+    if savings > 0 {
+        println!("  Space saved:  {:.2} GB", savings as f64 / 1_000_000_000.0);
+    }
+    println!();
+    println!("Storage");
+    println!("  Current size: {:.2} GB", current_size as f64 / 1_000_000_000.0);
+
+    Ok(())
+}
+
+async fn transcode_files(
+    pool: &DbPool,
+    crf: u8,
+    preset: String,
+    use_hardware: bool,
+    kept_only: bool,
+    limit: Option<usize>,
+    verify: bool,
+) -> Result<()> {
+    use dvrreview::transcode::{TranscodeConfig, Transcoder};
+
+    let mut conn = pool.get().await?;
+
+    // Clean up any stale .transcoding files and reset their status
+    let stale_files: Vec<File> = files::table
+        .filter(files::transcode_status.eq(TranscodeStatus::Transcoding))
+        .load(&mut conn)
+        .await?;
+
+    for file in &stale_files {
+        let transcoding_path = Transcoder::transcoding_path(&PathBuf::from(&file.path));
+        if transcoding_path.exists() {
+            tracing::info!("Cleaning up stale transcoding file: {:?}", transcoding_path);
+            let _ = std::fs::remove_file(&transcoding_path);
+        }
+
+        diesel::update(files::table.find(file.id))
+            .set(files::transcode_status.eq(TranscodeStatus::Pending))
+            .execute(&mut conn)
+            .await?;
+    }
+
+    // Get files to transcode, ordered by size descending (large first)
+    let mut query = files::table
+        .filter(files::transcode_status.eq(TranscodeStatus::Pending))
+        .into_boxed();
+
+    if kept_only {
+        query = query.filter(files::status.eq(dvrreview::db::models::FileStatus::Kept));
+    }
+
+    let mut files_to_transcode: Vec<File> = query
+        .order(files::size_bytes.desc())
+        .load(&mut conn)
+        .await?;
+
+    if let Some(max) = limit {
+        files_to_transcode.truncate(max);
+    }
+
+    if files_to_transcode.is_empty() {
+        tracing::info!("No files to transcode.");
+        return Ok(());
+    }
+
+    let total_size: i64 = files_to_transcode.iter().map(|f| f.size_bytes).sum();
+    tracing::info!(
+        "Transcoding {} files ({:.2} GB), largest first",
+        files_to_transcode.len(),
+        total_size as f64 / 1_000_000_000.0
+    );
+
+    if use_hardware {
+        if let Some(hw) = dvrreview::transcode::detect_hardware_encoder() {
+            tracing::info!("Using hardware encoder: {}", hw);
+        } else {
+            tracing::warn!("No hardware encoder detected, falling back to software");
+        }
+    }
+
+    let config = TranscodeConfig {
+        crf,
+        preset,
+        use_hardware,
+        audio_codec: "aac".to_string(),
+        container: "mkv".to_string(),
+    };
+
+    let transcoder = Transcoder::new(config);
+    let mut total_saved: i64 = 0;
+    let mut success_count = 0;
+    let mut fail_count = 0;
+
+    for (i, file) in files_to_transcode.iter().enumerate() {
+        let input_path = PathBuf::from(&file.path);
+
+        if !input_path.exists() {
+            tracing::warn!("File not found, skipping: {:?}", input_path);
+            diesel::update(files::table.find(file.id))
+                .set(files::transcode_status.eq(TranscodeStatus::Failed))
+                .execute(&mut conn)
+                .await?;
+            continue;
+        }
+
+        tracing::info!(
+            "[{}/{}] Transcoding {:?} ({:.2} GB)",
+            i + 1,
+            files_to_transcode.len(),
+            input_path.file_name().unwrap_or_default(),
+            file.size_bytes as f64 / 1_000_000_000.0
+        );
+
+        // Mark as transcoding
+        diesel::update(files::table.find(file.id))
+            .set(files::transcode_status.eq(TranscodeStatus::Transcoding))
+            .execute(&mut conn)
+            .await?;
+
+        // Transcode
+        let result = match transcoder.transcode(&input_path, file.content_start_ms, file.content_end_ms) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!("Transcode failed: {}", e);
+                transcoder.cleanup_failed(&Transcoder::transcoding_path(&input_path)).ok();
+                diesel::update(files::table.find(file.id))
+                    .set(files::transcode_status.eq(TranscodeStatus::Failed))
+                    .execute(&mut conn)
+                    .await?;
+                fail_count += 1;
+                continue;
+            }
+        };
+
+        // Verify if enabled
+        if verify {
+            diesel::update(files::table.find(file.id))
+                .set(files::transcode_status.eq(TranscodeStatus::Verifying))
+                .execute(&mut conn)
+                .await?;
+
+            match transcoder.verify(&input_path, &result.transcoding_path) {
+                Ok(v) if v.passed => {
+                    tracing::info!("{}", v.message);
+                }
+                Ok(v) => {
+                    tracing::error!("{}", v.message);
+                    transcoder.cleanup_failed(&result.transcoding_path).ok();
+                    diesel::update(files::table.find(file.id))
+                        .set(files::transcode_status.eq(TranscodeStatus::Failed))
+                        .execute(&mut conn)
+                        .await?;
+                    fail_count += 1;
+                    continue;
+                }
+                Err(e) => {
+                    tracing::error!("Verification error: {}", e);
+                    transcoder.cleanup_failed(&result.transcoding_path).ok();
+                    diesel::update(files::table.find(file.id))
+                        .set(files::transcode_status.eq(TranscodeStatus::Failed))
+                        .execute(&mut conn)
+                        .await?;
+                    fail_count += 1;
+                    continue;
+                }
+            }
+        }
+
+        // Finalize - rename and delete original
+        if let Err(e) = transcoder.finalize(&result, &input_path) {
+            tracing::error!("Finalize failed: {}", e);
+            diesel::update(files::table.find(file.id))
+                .set(files::transcode_status.eq(TranscodeStatus::Failed))
+                .execute(&mut conn)
+                .await?;
+            fail_count += 1;
+            continue;
+        }
+
+        // Update database
+        diesel::update(files::table.find(file.id))
+            .set((
+                files::transcode_status.eq(TranscodeStatus::Completed),
+                files::transcoded_path.eq(result.final_path.to_string_lossy().to_string()),
+                files::transcoded_at.eq(chrono::Utc::now()),
+                files::original_size_bytes.eq(result.original_size),
+                files::path.eq(result.final_path.to_string_lossy().to_string()),
+                files::size_bytes.eq(result.transcoded_size),
+            ))
+            .execute(&mut conn)
+            .await?;
+
+        total_saved += result.savings_bytes();
+        success_count += 1;
+
+        tracing::info!(
+            "Saved {:.2} GB ({:.1}%)",
+            result.savings_bytes() as f64 / 1_000_000_000.0,
+            result.savings_percent()
+        );
+    }
+
+    tracing::info!(
+        "Transcode complete. {} succeeded, {} failed. Total saved: {:.2} GB",
+        success_count,
+        fail_count,
+        total_saved as f64 / 1_000_000_000.0
+    );
 
     Ok(())
 }

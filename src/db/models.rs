@@ -25,6 +25,16 @@ pub enum ReviewDecision {
     NeedsMoreReview,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, FromSqlRow, AsExpression)]
+#[diesel(sql_type = Text)]
+pub enum TranscodeStatus {
+    Pending,
+    Transcoding,
+    Verifying,
+    Completed,
+    Failed,
+}
+
 impl ToSql<Text, Pg> for FileStatus {
     fn to_sql<'b>(&'b self, out: &mut Output<'b, '_, Pg>) -> serialize::Result {
         let s = match self {
@@ -73,6 +83,33 @@ impl FromSql<Text, Pg> for ReviewDecision {
     }
 }
 
+impl ToSql<Text, Pg> for TranscodeStatus {
+    fn to_sql<'b>(&'b self, out: &mut Output<'b, '_, Pg>) -> serialize::Result {
+        let s = match self {
+            TranscodeStatus::Pending => "pending",
+            TranscodeStatus::Transcoding => "transcoding",
+            TranscodeStatus::Verifying => "verifying",
+            TranscodeStatus::Completed => "completed",
+            TranscodeStatus::Failed => "failed",
+        };
+        <str as ToSql<Text, Pg>>::to_sql(s, out)
+    }
+}
+
+impl FromSql<Text, Pg> for TranscodeStatus {
+    fn from_sql(bytes: PgValue<'_>) -> deserialize::Result<Self> {
+        let s = <String as FromSql<Text, Pg>>::from_sql(bytes)?;
+        match s.as_str() {
+            "pending" => Ok(TranscodeStatus::Pending),
+            "transcoding" => Ok(TranscodeStatus::Transcoding),
+            "verifying" => Ok(TranscodeStatus::Verifying),
+            "completed" => Ok(TranscodeStatus::Completed),
+            "failed" => Ok(TranscodeStatus::Failed),
+            _ => Err(format!("Unknown transcode_status: {}", s).into()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Queryable, Selectable, Identifiable, Serialize)]
 #[diesel(table_name = crate::db::schema::files)]
 pub struct File {
@@ -93,6 +130,10 @@ pub struct File {
     pub status: FileStatus,
     pub created_at: DateTime<Utc>,
     pub fingerprinted_at: Option<DateTime<Utc>>,
+    pub transcoded_path: Option<String>,
+    pub transcoded_at: Option<DateTime<Utc>>,
+    pub original_size_bytes: Option<i64>,
+    pub transcode_status: TranscodeStatus,
 }
 
 #[derive(Debug, Clone, Insertable)]
