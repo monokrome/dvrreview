@@ -243,11 +243,30 @@ impl Transcoder {
         // Move transcoding file to final name (try rename, fall back to copy+delete for cross-filesystem)
         if let Err(rename_err) = std::fs::rename(&result.transcoding_path, &result.final_path) {
             tracing::debug!(
-                "Rename failed ({}), falling back to copy+delete",
+                "Rename failed ({}), falling back to copy+delete with integrity check",
                 rename_err
             );
+
+            let source_hash = hash_file(&result.transcoding_path)
+                .context("Failed to hash temp file before copy")?;
+
             std::fs::copy(&result.transcoding_path, &result.final_path)
                 .context("Failed to copy transcoded file to final location")?;
+
+            let dest_hash = hash_file(&result.final_path)
+                .context("Failed to hash copied file")?;
+
+            if source_hash != dest_hash {
+                let _ = std::fs::remove_file(&result.final_path);
+                anyhow::bail!(
+                    "Copy integrity check failed: {} != {}",
+                    source_hash.to_hex(),
+                    dest_hash.to_hex()
+                );
+            }
+
+            tracing::debug!("Copy integrity verified (blake3: {})", source_hash.to_hex());
+
             std::fs::remove_file(&result.transcoding_path)
                 .context("Failed to remove temporary transcoded file")?;
         }
@@ -324,6 +343,15 @@ pub struct VerifyResult {
     pub passed: bool,
     pub similarity: f32,
     pub message: String,
+}
+
+fn hash_file(path: &Path) -> Result<blake3::Hash> {
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("Failed to open {:?} for hashing", path))?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update_reader(file)
+        .context("Failed to read file during hashing")?;
+    Ok(hasher.finalize())
 }
 
 pub fn detect_hardware_encoder() -> Option<&'static str> {

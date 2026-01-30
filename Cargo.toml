@@ -41,6 +41,9 @@ image = { version = "0.23", features = ["png", "jpeg"] }
 img_hash = "3"
 tempfile = "3"
 
+# Hashing
+blake3 = "1"
+
 # Text processing
 regex-lite = "0.1"
 
