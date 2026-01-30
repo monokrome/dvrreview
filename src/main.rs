@@ -1,13 +1,15 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
+use chrono::Utc;
 use clap::{Parser, Subcommand};
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
-use dvrreview::db::models::{File, NewCluster, NewClusterMember, NewFile, NewFingerprint, NewThumbnail, TranscodeStatus};
-use dvrreview::db::schema::{cluster_members, clusters, files, fingerprints, thumbnails};
+use dvrreview::db::models::{Dvr, File, NewCluster, NewClusterMember, NewDvr, NewFile, NewFingerprint, NewThumbnail, TranscodeStatus};
+use dvrreview::db::schema::{cluster_members, clusters, dvrs, files, fingerprints, thumbnails};
 use dvrreview::db::{self, DbPool};
 use dvrreview::scanner::fingerprint::{generate_sample_timestamps, generate_thumbnail_timestamps, Fingerprinter};
 use dvrreview::scanner::metadata::{parse_filename, MediaMetadata};
 use dvrreview::cluster::ClusterBuilder;
+use rand::prelude::IndexedRandom;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -18,18 +20,20 @@ use walkdir::WalkDir;
 #[derive(Parser)]
 #[command(name = "dvrreview", about = "DVR duplicate detection and review tool")]
 struct Cli {
+    /// Name of the DVR (used to identify this collection in the database)
+    name: String,
+
+    /// Path to the DVR root directory on this machine
+    path: PathBuf,
+
     #[command(subcommand)]
     command: Command,
 }
 
 #[derive(Subcommand)]
 enum Command {
-    /// Scan a directory for video files and extract metadata
+    /// Scan the DVR directory for video files and extract metadata
     Scan {
-        /// Directory to scan
-        #[arg(short, long)]
-        path: PathBuf,
-
         /// File extensions to include (default: ts,mpg,mpeg,mp4,mkv,avi)
         #[arg(short, long, default_value = "ts,mpg,mpeg,mp4,mkv,avi")]
         extensions: String,
@@ -44,6 +48,10 @@ enum Command {
         /// Only process files without fingerprints
         #[arg(long, default_value = "true")]
         incremental: bool,
+
+        /// Skip DVR verification before fingerprinting
+        #[arg(long)]
+        no_verify: bool,
     },
 
     /// Generate thumbnail images for the review UI
@@ -73,10 +81,6 @@ enum Command {
         /// Directory containing thumbnails
         #[arg(short, long)]
         thumbnails: PathBuf,
-
-        /// Root directory of media files (for serving video)
-        #[arg(short, long)]
-        media: PathBuf,
     },
 
     /// Show statistics
@@ -107,7 +111,32 @@ enum Command {
         /// Skip verification (not recommended)
         #[arg(long)]
         no_verify: bool,
+
+        /// Directory for temporary transcoding files (reduces NAS I/O contention)
+        #[arg(long)]
+        temp_dir: Option<PathBuf>,
     },
+
+    /// Verify this is the correct DVR by checking fingerprints
+    Verify,
+}
+
+struct DvrContext {
+    dvr: Dvr,
+    base_path: PathBuf,
+}
+
+impl DvrContext {
+    fn resolve_path(&self, relative_path: &str) -> PathBuf {
+        self.base_path.join(relative_path)
+    }
+
+    fn make_relative(&self, absolute_path: &PathBuf) -> Result<String> {
+        let rel = absolute_path
+            .strip_prefix(&self.base_path)
+            .context("Path is not within DVR base directory")?;
+        Ok(rel.to_string_lossy().to_string())
+    }
 }
 
 #[tokio::main]
@@ -122,24 +151,38 @@ async fn main() -> Result<()> {
     let database_url = std::env::var("DATABASE_URL").context("DATABASE_URL must be set")?;
     let pool = db::create_pool(&database_url);
 
+    // Canonicalize the base path
+    let base_path = cli.path.canonicalize().context("Invalid DVR path")?;
+
+    if !base_path.is_dir() {
+        bail!("DVR path must be a directory: {:?}", base_path);
+    }
+
+    // Get or create the DVR record
+    // Skip verification for verify, stats commands, and when --no-verify is passed
+    let skip_verify = matches!(cli.command, Command::Verify | Command::Stats)
+        || matches!(cli.command, Command::Fingerprint { no_verify: true, .. })
+        || matches!(cli.command, Command::Transcode { no_verify: true, .. });
+    let ctx = get_or_create_dvr(&pool, &cli.name, &base_path, skip_verify).await?;
+
     match cli.command {
-        Command::Scan { path, extensions } => {
-            scan_directory(&pool, &path, &extensions).await?;
+        Command::Scan { extensions } => {
+            scan_directory(&pool, &ctx, &extensions).await?;
         }
-        Command::Fingerprint { samples, incremental } => {
-            generate_fingerprints(&pool, samples, incremental).await?;
+        Command::Fingerprint { samples, incremental, .. } => {
+            generate_fingerprints(&pool, &ctx, samples, incremental).await?;
         }
         Command::Thumbnails { output, count } => {
-            generate_thumbnails(&pool, &output, count).await?;
+            generate_thumbnails(&pool, &ctx, &output, count).await?;
         }
         Command::Cluster { threshold } => {
-            build_clusters(&pool, threshold).await?;
+            build_clusters(&pool, &ctx, threshold).await?;
         }
-        Command::Serve { addr, thumbnails, media } => {
-            dvrreview::web::run_server(pool, thumbnails, media, addr).await?;
+        Command::Serve { addr, thumbnails } => {
+            dvrreview::web::run_server(pool, thumbnails, ctx.base_path.clone(), addr).await?;
         }
         Command::Stats => {
-            show_stats(&pool).await?;
+            show_stats(&pool, &ctx).await?;
         }
         Command::Transcode {
             crf,
@@ -148,24 +191,297 @@ async fn main() -> Result<()> {
             kept_only,
             limit,
             no_verify,
+            temp_dir,
         } => {
-            transcode_files(&pool, crf, preset, hardware, kept_only, limit, !no_verify).await?;
+            transcode_files(&pool, &ctx, crf, preset, hardware, kept_only, limit, !no_verify, temp_dir).await?;
+        }
+        Command::Verify => {
+            verify_dvr(&pool, &ctx).await?;
         }
     }
 
     Ok(())
 }
 
-async fn scan_directory(pool: &DbPool, path: &PathBuf, extensions: &str) -> Result<()> {
+async fn get_or_create_dvr(pool: &DbPool, name: &str, base_path: &PathBuf, skip_verify: bool) -> Result<DvrContext> {
+    let mut conn = pool.get().await.context("Failed to get database connection")?;
+
+    // Try to find existing DVR
+    let existing: Option<Dvr> = dvrs::table
+        .filter(dvrs::name.eq(name))
+        .first(&mut conn)
+        .await
+        .optional()?;
+
+    let dvr = if let Some(dvr) = existing {
+        tracing::info!("Found existing DVR: {} (id: {})", dvr.name, dvr.id);
+
+        // Verify by sampling fingerprints (unless skipped)
+        if !skip_verify {
+            let sample_result = sample_verify(pool, &dvr, base_path).await?;
+
+            if !sample_result.is_empty() && !sample_result.verified {
+                bail!(
+                    "DVR verification failed. {} of {} sampled files had matching fingerprints.\n\
+                     This may not be the correct location for DVR '{}'.\n\
+                     Run 'dvrreview {} {:?} verify' for detailed results.",
+                    sample_result.matched,
+                    sample_result.total,
+                    name,
+                    name,
+                    base_path
+                );
+            }
+
+            // Update last_verified_at
+            diesel::update(dvrs::table.find(dvr.id))
+                .set(dvrs::last_verified_at.eq(Utc::now()))
+                .execute(&mut conn)
+                .await?;
+        }
+
+        dvr
+    } else {
+        tracing::info!("Creating new DVR: {}", name);
+
+        let new_dvr = NewDvr {
+            name: name.to_string(),
+        };
+
+        diesel::insert_into(dvrs::table)
+            .values(&new_dvr)
+            .get_result(&mut conn)
+            .await?
+    };
+
+    Ok(DvrContext {
+        dvr,
+        base_path: base_path.clone(),
+    })
+}
+
+struct VerifyResult {
+    total: usize,
+    matched: usize,
+    verified: bool,
+}
+
+impl VerifyResult {
+    fn is_empty(&self) -> bool {
+        self.total == 0
+    }
+}
+
+async fn sample_verify(pool: &DbPool, dvr: &Dvr, base_path: &PathBuf) -> Result<VerifyResult> {
+    let mut conn = pool.get().await.context("Failed to get database connection")?;
+
+    // Get files with fingerprints for this DVR
+    let fingerprinted_files: Vec<File> = files::table
+        .filter(files::dvr_id.eq(dvr.id))
+        .filter(files::fingerprinted_at.is_not_null())
+        .filter(files::relative_path.is_not_null())
+        .load(&mut conn)
+        .await?;
+
+    if fingerprinted_files.is_empty() {
+        return Ok(VerifyResult {
+            total: 0,
+            matched: 0,
+            verified: true,
+        });
+    }
+
+    // Sample up to 5 random files
+    let sample_size = std::cmp::min(5, fingerprinted_files.len());
+    let mut rng = rand::rng();
+    let sample: Vec<&File> = fingerprinted_files
+        .choose_multiple(&mut rng, sample_size)
+        .collect();
+
+    let fingerprinter = Fingerprinter::new();
+    let mut matched = 0;
+
+    for file in &sample {
+        let rel_path = match &file.relative_path {
+            Some(p) => p,
+            None => continue,
+        };
+
+        let full_path = base_path.join(rel_path);
+
+        if !full_path.exists() {
+            tracing::debug!("Sample file not found: {:?}", full_path);
+            continue;
+        }
+
+        // Get stored fingerprints
+        let stored_fps: Vec<(i32, Vec<u8>)> = fingerprints::table
+            .filter(fingerprints::file_id.eq(file.id))
+            .filter(fingerprints::frame_hash.is_not_null())
+            .select((fingerprints::timestamp_ms, fingerprints::frame_hash.assume_not_null()))
+            .limit(3)
+            .load(&mut conn)
+            .await?;
+
+        if stored_fps.is_empty() {
+            continue;
+        }
+
+        // Extract current fingerprints at same timestamps
+        let timestamps: Vec<i32> = stored_fps.iter().map(|(ts, _)| *ts).collect();
+
+        let current_fps = match fingerprinter.extract_frame_hashes(&full_path, &timestamps) {
+            Ok(fps) => fps,
+            Err(e) => {
+                tracing::debug!("Failed to extract fingerprints from {:?}: {}", full_path, e);
+                continue;
+            }
+        };
+
+        // Compare fingerprints
+        let mut file_matched = true;
+        for (ts, stored_hash) in &stored_fps {
+            if let Some((_, current_hash)) = current_fps.iter().find(|(t, _)| t == ts) {
+                let similarity = fingerprinter.compare_hashes(stored_hash, current_hash);
+                if similarity < 0.9 {
+                    file_matched = false;
+                    break;
+                }
+            } else {
+                file_matched = false;
+                break;
+            }
+        }
+
+        if file_matched {
+            matched += 1;
+        }
+    }
+
+    // Require at least 80% of samples to match
+    let verified = matched as f32 / sample.len() as f32 >= 0.8;
+
+    Ok(VerifyResult {
+        total: sample.len(),
+        matched,
+        verified,
+    })
+}
+
+async fn verify_dvr(pool: &DbPool, ctx: &DvrContext) -> Result<()> {
+    let mut conn = pool.get().await.context("Failed to get database connection")?;
+
+    let fingerprinted_files: Vec<File> = files::table
+        .filter(files::dvr_id.eq(ctx.dvr.id))
+        .filter(files::fingerprinted_at.is_not_null())
+        .filter(files::relative_path.is_not_null())
+        .load(&mut conn)
+        .await?;
+
+    if fingerprinted_files.is_empty() {
+        println!("No fingerprinted files found for DVR '{}'.", ctx.dvr.name);
+        return Ok(());
+    }
+
+    let sample_size = std::cmp::min(10, fingerprinted_files.len());
+    let mut rng = rand::rng();
+    let sample: Vec<&File> = fingerprinted_files
+        .choose_multiple(&mut rng, sample_size)
+        .collect();
+
+    let fingerprinter = Fingerprinter::new();
+    let mut matched = 0;
+    let mut missing = 0;
+    let mut mismatched = 0;
+
+    for file in &sample {
+        let rel_path = match &file.relative_path {
+            Some(p) => p,
+            None => continue,
+        };
+
+        let full_path = ctx.resolve_path(rel_path);
+
+        if !full_path.exists() {
+            println!("  MISSING: {}", rel_path);
+            missing += 1;
+            continue;
+        }
+
+        let stored_fps: Vec<(i32, Vec<u8>)> = fingerprints::table
+            .filter(fingerprints::file_id.eq(file.id))
+            .filter(fingerprints::frame_hash.is_not_null())
+            .select((fingerprints::timestamp_ms, fingerprints::frame_hash.assume_not_null()))
+            .limit(3)
+            .load(&mut conn)
+            .await?;
+
+        if stored_fps.is_empty() {
+            println!("  NO FINGERPRINTS: {} (file_id: {})", rel_path, file.id);
+            continue;
+        }
+
+        let timestamps: Vec<i32> = stored_fps.iter().map(|(ts, _)| *ts).collect();
+
+        let current_fps = match fingerprinter.extract_frame_hashes(&full_path, &timestamps) {
+            Ok(fps) => fps,
+            Err(e) => {
+                println!("  ERROR: {} - {}", rel_path, e);
+                mismatched += 1;
+                continue;
+            }
+        };
+
+        let mut file_matched = true;
+        for (ts, stored_hash) in &stored_fps {
+            if let Some((_, current_hash)) = current_fps.iter().find(|(t, _)| t == ts) {
+                let similarity = fingerprinter.compare_hashes(stored_hash, current_hash);
+                if similarity < 0.9 {
+                    file_matched = false;
+                    break;
+                }
+            } else {
+                file_matched = false;
+                break;
+            }
+        }
+
+        if file_matched {
+            println!("  OK: {}", rel_path);
+            matched += 1;
+        } else {
+            println!("  MISMATCH: {}", rel_path);
+            mismatched += 1;
+        }
+    }
+
+    println!();
+    println!("Verified {} files:", sample_size);
+    println!("  Matched:    {}", matched);
+    println!("  Missing:    {}", missing);
+    println!("  Mismatched: {}", mismatched);
+
+    if matched as f32 / sample_size as f32 >= 0.8 {
+        println!();
+        println!("Verification PASSED. This appears to be the correct DVR location.");
+    } else {
+        println!();
+        println!("Verification FAILED. This may not be the correct location for DVR '{}'.", ctx.dvr.name);
+    }
+
+    Ok(())
+}
+
+async fn scan_directory(pool: &DbPool, ctx: &DvrContext, extensions: &str) -> Result<()> {
     let exts: Vec<&str> = extensions.split(',').collect();
 
-    tracing::info!("Scanning {:?} for files with extensions: {:?}", path, exts);
+    tracing::info!("Scanning {:?} for files with extensions: {:?}", ctx.base_path, exts);
 
-    let mut conn = pool.get().await?;
+    let mut conn = pool.get().await.context("Failed to get database connection")?;
     let mut scanned = 0;
     let mut skipped = 0;
 
-    for entry in WalkDir::new(path)
+    for entry in WalkDir::new(&ctx.base_path)
         .follow_links(true)
         .into_iter()
         .filter_map(|e| e.ok())
@@ -185,11 +501,14 @@ async fn scan_directory(pool: &DbPool, path: &PathBuf, extensions: &str) -> Resu
             continue;
         }
 
-        let path_str = file_path.to_string_lossy().to_string();
+        let abs_path = file_path.canonicalize()?;
+        let relative_path = ctx.make_relative(&abs_path)?;
 
-        // Check if already in DB
+        // Check if already in DB for this DVR
         let exists: bool = diesel::select(diesel::dsl::exists(
-            files::table.filter(files::path.eq(&path_str)),
+            files::table
+                .filter(files::dvr_id.eq(ctx.dvr.id))
+                .filter(files::relative_path.eq(&relative_path)),
         ))
         .get_result(&mut conn)
         .await?;
@@ -200,27 +519,28 @@ async fn scan_directory(pool: &DbPool, path: &PathBuf, extensions: &str) -> Resu
         }
 
         // Get file size
-        let metadata = std::fs::metadata(file_path)?;
+        let metadata = std::fs::metadata(&abs_path)?;
         let size_bytes = metadata.len() as i64;
 
         // Extract media metadata
-        let media_meta = match MediaMetadata::extract(file_path) {
+        let media_meta = match MediaMetadata::extract(&abs_path) {
             Ok(m) => m,
             Err(e) => {
-                tracing::warn!("Failed to extract metadata from {:?}: {}", file_path, e);
+                tracing::warn!("Failed to extract metadata from {:?}: {}", abs_path, e);
                 continue;
             }
         };
 
         // Parse filename for claimed show info
-        let filename = file_path
+        let filename = abs_path
             .file_name()
             .and_then(|f| f.to_str())
             .unwrap_or("");
         let parsed = parse_filename(filename);
 
+        // Store full path for legacy compatibility, but also store relative
         let new_file = NewFile {
-            path: path_str,
+            path: abs_path.to_string_lossy().to_string(),
             size_bytes,
             duration_ms: media_meta.duration_ms,
             video_codec: media_meta.video_codec,
@@ -231,6 +551,8 @@ async fn scan_directory(pool: &DbPool, path: &PathBuf, extensions: &str) -> Resu
             claimed_title: parsed.title,
             claimed_season: parsed.season,
             claimed_episode: parsed.episode,
+            dvr_id: Some(ctx.dvr.id),
+            relative_path: Some(relative_path),
         };
 
         diesel::insert_into(files::table)
@@ -254,18 +576,25 @@ async fn scan_directory(pool: &DbPool, path: &PathBuf, extensions: &str) -> Resu
     Ok(())
 }
 
-async fn generate_fingerprints(pool: &DbPool, samples: usize, incremental: bool) -> Result<()> {
-    let mut conn = pool.get().await?;
+async fn generate_fingerprints(pool: &DbPool, ctx: &DvrContext, samples: usize, incremental: bool) -> Result<()> {
+    let mut conn = pool.get().await.context("Failed to get database connection")?;
 
+    // Skip files currently being transcoded
     let files_to_process: Vec<File> = if incremental {
         files::table
+            .filter(files::dvr_id.eq(ctx.dvr.id))
             .filter(files::fingerprinted_at.is_null())
             .filter(files::duration_ms.is_not_null())
+            .filter(files::transcode_status.ne(TranscodeStatus::Transcoding))
+            .filter(files::transcode_status.ne(TranscodeStatus::Verifying))
             .load(&mut conn)
             .await?
     } else {
         files::table
+            .filter(files::dvr_id.eq(ctx.dvr.id))
             .filter(files::duration_ms.is_not_null())
+            .filter(files::transcode_status.ne(TranscodeStatus::Transcoding))
+            .filter(files::transcode_status.ne(TranscodeStatus::Verifying))
             .load(&mut conn)
             .await?
     };
@@ -281,15 +610,25 @@ async fn generate_fingerprints(pool: &DbPool, samples: usize, incremental: bool)
         };
 
         let timestamps = generate_sample_timestamps(duration, samples);
-        let path = PathBuf::from(&file.path);
+
+        // Resolve path using relative_path if available, else fall back to absolute
+        let path = match &file.relative_path {
+            Some(rel) => ctx.resolve_path(rel),
+            None => PathBuf::from(&file.path),
+        };
 
         match fingerprinter.extract_frame_hashes(&path, &timestamps) {
             Ok(hashes) => {
-                for (ts, hash) in hashes {
+                if hashes.is_empty() {
+                    tracing::warn!("No frames extracted from {:?}", path);
+                    continue;
+                }
+
+                for (ts, hash) in &hashes {
                     let new_fp = NewFingerprint {
                         file_id: file.id,
-                        timestamp_ms: ts,
-                        frame_hash: Some(hash),
+                        timestamp_ms: *ts,
+                        frame_hash: Some(hash.clone()),
                         audio_hash: None,
                     };
 
@@ -302,12 +641,12 @@ async fn generate_fingerprints(pool: &DbPool, samples: usize, incremental: bool)
                 }
 
                 diesel::update(files::table.find(file.id))
-                    .set(files::fingerprinted_at.eq(chrono::Utc::now()))
+                    .set(files::fingerprinted_at.eq(Utc::now()))
                     .execute(&mut conn)
                     .await?;
             }
             Err(e) => {
-                tracing::warn!("Failed to fingerprint {:?}: {}", file.path, e);
+                tracing::warn!("Failed to fingerprint {:?}: {}", path, e);
             }
         }
 
@@ -320,14 +659,14 @@ async fn generate_fingerprints(pool: &DbPool, samples: usize, incremental: bool)
     Ok(())
 }
 
-async fn generate_thumbnails(pool: &DbPool, output_dir: &PathBuf, count: usize) -> Result<()> {
+async fn generate_thumbnails(pool: &DbPool, ctx: &DvrContext, output_dir: &PathBuf, count: usize) -> Result<()> {
     std::fs::create_dir_all(output_dir)?;
 
-    let mut conn = pool.get().await?;
+    let mut conn = pool.get().await.context("Failed to get database connection")?;
 
-    // Get files that don't have thumbnails yet
     let files_needing_thumbs: Vec<File> = files::table
         .left_join(thumbnails::table)
+        .filter(files::dvr_id.eq(ctx.dvr.id))
         .filter(thumbnails::id.is_null())
         .filter(files::duration_ms.is_not_null())
         .select(File::as_select())
@@ -344,6 +683,11 @@ async fn generate_thumbnails(pool: &DbPool, output_dir: &PathBuf, count: usize) 
 
         let timestamps = generate_thumbnail_timestamps(duration, count);
 
+        let file_path = match &file.relative_path {
+            Some(rel) => ctx.resolve_path(rel),
+            None => PathBuf::from(&file.path),
+        };
+
         for ts in timestamps {
             let ts_secs = ts as f64 / 1000.0;
             let thumb_filename = format!("{}_{}.jpg", file.id, ts);
@@ -354,7 +698,9 @@ async fn generate_thumbnails(pool: &DbPool, output_dir: &PathBuf, count: usize) 
                     "-ss",
                     &format!("{:.3}", ts_secs),
                     "-i",
-                    &file.path,
+                ])
+                .arg(&file_path)
+                .args([
                     "-vframes",
                     "1",
                     "-vf",
@@ -391,12 +737,15 @@ async fn generate_thumbnails(pool: &DbPool, output_dir: &PathBuf, count: usize) 
     Ok(())
 }
 
-async fn build_clusters(pool: &DbPool, threshold: f32) -> Result<()> {
-    let mut conn = pool.get().await?;
+async fn build_clusters(pool: &DbPool, ctx: &DvrContext, threshold: f32) -> Result<()> {
+    let mut conn = pool.get().await.context("Failed to get database connection")?;
 
-    // Group files by claimed title first
+    // Skip files currently being transcoded
     let all_files: Vec<File> = files::table
+        .filter(files::dvr_id.eq(ctx.dvr.id))
         .filter(files::fingerprinted_at.is_not_null())
+        .filter(files::transcode_status.ne(TranscodeStatus::Transcoding))
+        .filter(files::transcode_status.ne(TranscodeStatus::Verifying))
         .load(&mut conn)
         .await?;
 
@@ -414,7 +763,6 @@ async fn build_clusters(pool: &DbPool, threshold: f32) -> Result<()> {
             continue;
         }
 
-        // Load fingerprints for these files
         let file_ids: Vec<Uuid> = title_files.iter().map(|f| f.id).collect();
         let fps: Vec<(Uuid, Vec<u8>)> = fingerprints::table
             .filter(fingerprints::file_id.eq_any(&file_ids))
@@ -469,13 +817,39 @@ async fn build_clusters(pool: &DbPool, threshold: f32) -> Result<()> {
     Ok(())
 }
 
-async fn show_stats(pool: &DbPool) -> Result<()> {
-    let mut conn = pool.get().await?;
+async fn show_stats(pool: &DbPool, ctx: &DvrContext) -> Result<()> {
+    let mut conn = pool.get().await.context("Failed to get database connection")?;
 
-    let total_files: i64 = files::table.count().get_result(&mut conn).await?;
+    let total_files: i64 = files::table
+        .filter(files::dvr_id.eq(ctx.dvr.id))
+        .count()
+        .get_result(&mut conn)
+        .await?;
 
     let fingerprinted: i64 = files::table
+        .filter(files::dvr_id.eq(ctx.dvr.id))
         .filter(files::fingerprinted_at.is_not_null())
+        .count()
+        .get_result(&mut conn)
+        .await?;
+
+    // Count files that actually have fingerprint records
+    let file_ids_for_dvr: Vec<Uuid> = files::table
+        .filter(files::dvr_id.eq(ctx.dvr.id))
+        .select(files::id)
+        .load(&mut conn)
+        .await?;
+
+    let files_with_fps: i64 = fingerprints::table
+        .filter(fingerprints::file_id.eq_any(&file_ids_for_dvr))
+        .select(fingerprints::file_id)
+        .distinct()
+        .count()
+        .get_result(&mut conn)
+        .await?;
+
+    let total_fp_records: i64 = fingerprints::table
+        .filter(fingerprints::file_id.eq_any(&file_ids_for_dvr))
         .count()
         .get_result(&mut conn)
         .await?;
@@ -487,27 +861,29 @@ async fn show_stats(pool: &DbPool) -> Result<()> {
         .get_result(&mut conn)
         .await?;
 
-    // Transcode stats
     let transcoded: i64 = files::table
+        .filter(files::dvr_id.eq(ctx.dvr.id))
         .filter(files::transcode_status.eq(TranscodeStatus::Completed))
         .count()
         .get_result(&mut conn)
         .await?;
 
     let pending_transcode: i64 = files::table
+        .filter(files::dvr_id.eq(ctx.dvr.id))
         .filter(files::transcode_status.eq(TranscodeStatus::Pending))
         .count()
         .get_result(&mut conn)
         .await?;
 
     let failed_transcode: i64 = files::table
+        .filter(files::dvr_id.eq(ctx.dvr.id))
         .filter(files::transcode_status.eq(TranscodeStatus::Failed))
         .count()
         .get_result(&mut conn)
         .await?;
 
-    // Calculate space savings
     let transcoded_files: Vec<File> = files::table
+        .filter(files::dvr_id.eq(ctx.dvr.id))
         .filter(files::transcode_status.eq(TranscodeStatus::Completed))
         .filter(files::original_size_bytes.is_not_null())
         .load(&mut conn)
@@ -518,21 +894,32 @@ async fn show_stats(pool: &DbPool) -> Result<()> {
         .map(|f| f.original_size_bytes.unwrap_or(0) - f.size_bytes)
         .sum();
 
-    let all_files: Vec<File> = files::table.load(&mut conn).await?;
+    let all_files: Vec<File> = files::table
+        .filter(files::dvr_id.eq(ctx.dvr.id))
+        .load(&mut conn)
+        .await?;
+
     let current_size: i64 = all_files.iter().map(|f| f.size_bytes).sum();
 
+    println!("DVR: {} (id: {})", ctx.dvr.name, ctx.dvr.id);
+    println!("Path: {:?}", ctx.base_path);
+    if let Some(verified) = ctx.dvr.last_verified_at {
+        println!("Last verified: {}", verified);
+    }
+    println!();
     println!("Files");
-    println!("  Total:        {}", total_files);
-    println!("  Fingerprinted:{}", fingerprinted);
+    println!("  Total:           {}", total_files);
+    println!("  Fingerprinted:   {} (flag set)", fingerprinted);
+    println!("  With FP records: {} ({} records)", files_with_fps, total_fp_records);
     println!();
     println!("Dedup");
-    println!("  Clusters:     {}", total_clusters);
-    println!("  Reviews:      {}", reviewed);
+    println!("  Clusters:        {}", total_clusters);
+    println!("  Reviews:         {}", reviewed);
     println!();
     println!("Transcode");
-    println!("  Completed:    {}", transcoded);
-    println!("  Pending:      {}", pending_transcode);
-    println!("  Failed:       {}", failed_transcode);
+    println!("  Completed:       {}", transcoded);
+    println!("  Pending:         {}", pending_transcode);
+    println!("  Failed:          {}", failed_transcode);
     if savings > 0 {
         println!("  Space saved:  {:.2} GB", savings as f64 / 1_000_000_000.0);
     }
@@ -545,28 +932,41 @@ async fn show_stats(pool: &DbPool) -> Result<()> {
 
 async fn transcode_files(
     pool: &DbPool,
+    ctx: &DvrContext,
     crf: u8,
     preset: String,
     use_hardware: bool,
     kept_only: bool,
     limit: Option<usize>,
     verify: bool,
+    temp_dir: Option<PathBuf>,
 ) -> Result<()> {
     use dvrreview::transcode::{TranscodeConfig, Transcoder};
 
-    let mut conn = pool.get().await?;
+    let mut conn = pool.get().await.context("Failed to get database connection")?;
 
     // Clean up any stale .transcoding files and reset their status
     let stale_files: Vec<File> = files::table
+        .filter(files::dvr_id.eq(ctx.dvr.id))
         .filter(files::transcode_status.eq(TranscodeStatus::Transcoding))
         .load(&mut conn)
         .await?;
 
     for file in &stale_files {
-        let transcoding_path = Transcoder::transcoding_path(&PathBuf::from(&file.path));
-        if transcoding_path.exists() {
-            tracing::info!("Cleaning up stale transcoding file: {:?}", transcoding_path);
-            let _ = std::fs::remove_file(&transcoding_path);
+        let file_path = match &file.relative_path {
+            Some(rel) => ctx.resolve_path(rel),
+            None => PathBuf::from(&file.path),
+        };
+
+        // Check both the default location (next to original) and temp dir
+        for path in [
+            Transcoder::transcoding_path(&file_path, None),
+            Transcoder::transcoding_path(&file_path, temp_dir.as_deref()),
+        ] {
+            if path.exists() {
+                tracing::info!("Cleaning up stale transcoding file: {:?}", path);
+                let _ = std::fs::remove_file(&path);
+            }
         }
 
         diesel::update(files::table.find(file.id))
@@ -577,6 +977,7 @@ async fn transcode_files(
 
     // Get files to transcode, ordered by size descending (large first)
     let mut query = files::table
+        .filter(files::dvr_id.eq(ctx.dvr.id))
         .filter(files::transcode_status.eq(TranscodeStatus::Pending))
         .into_boxed();
 
@@ -613,6 +1014,11 @@ async fn transcode_files(
         }
     }
 
+    if let Some(ref dir) = temp_dir {
+        std::fs::create_dir_all(dir).context("Failed to create temp directory")?;
+        tracing::info!("Using temp directory for transcoding: {:?}", dir);
+    }
+
     let config = TranscodeConfig {
         crf,
         preset,
@@ -627,7 +1033,10 @@ async fn transcode_files(
     let mut fail_count = 0;
 
     for (i, file) in files_to_transcode.iter().enumerate() {
-        let input_path = PathBuf::from(&file.path);
+        let input_path = match &file.relative_path {
+            Some(rel) => ctx.resolve_path(rel),
+            None => PathBuf::from(&file.path),
+        };
 
         if !input_path.exists() {
             tracing::warn!("File not found, skipping: {:?}", input_path);
@@ -646,18 +1055,16 @@ async fn transcode_files(
             file.size_bytes as f64 / 1_000_000_000.0
         );
 
-        // Mark as transcoding
         diesel::update(files::table.find(file.id))
             .set(files::transcode_status.eq(TranscodeStatus::Transcoding))
             .execute(&mut conn)
             .await?;
 
-        // Transcode
-        let result = match transcoder.transcode(&input_path, file.content_start_ms, file.content_end_ms) {
+        let result = match transcoder.transcode(&input_path, file.content_start_ms, file.content_end_ms, temp_dir.as_deref()) {
             Ok(r) => r,
             Err(e) => {
                 tracing::error!("Transcode failed: {}", e);
-                transcoder.cleanup_failed(&Transcoder::transcoding_path(&input_path)).ok();
+                transcoder.cleanup_failed(&Transcoder::transcoding_path(&input_path, temp_dir.as_deref())).ok();
                 diesel::update(files::table.find(file.id))
                     .set(files::transcode_status.eq(TranscodeStatus::Failed))
                     .execute(&mut conn)
@@ -667,7 +1074,6 @@ async fn transcode_files(
             }
         };
 
-        // Verify if enabled
         if verify {
             diesel::update(files::table.find(file.id))
                 .set(files::transcode_status.eq(TranscodeStatus::Verifying))
@@ -701,7 +1107,6 @@ async fn transcode_files(
             }
         }
 
-        // Finalize - rename and delete original
         if let Err(e) = transcoder.finalize(&result, &input_path) {
             tracing::error!("Finalize failed: {}", e);
             diesel::update(files::table.find(file.id))
@@ -712,14 +1117,17 @@ async fn transcode_files(
             continue;
         }
 
-        // Update database
+        // Update both absolute and relative paths to new file
+        let new_relative = ctx.make_relative(&result.final_path).ok();
+
         diesel::update(files::table.find(file.id))
             .set((
                 files::transcode_status.eq(TranscodeStatus::Completed),
                 files::transcoded_path.eq(result.final_path.to_string_lossy().to_string()),
-                files::transcoded_at.eq(chrono::Utc::now()),
+                files::transcoded_at.eq(Utc::now()),
                 files::original_size_bytes.eq(result.original_size),
                 files::path.eq(result.final_path.to_string_lossy().to_string()),
+                files::relative_path.eq(new_relative),
                 files::size_bytes.eq(result.transcoded_size),
             ))
             .execute(&mut conn)

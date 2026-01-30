@@ -17,6 +17,10 @@ diesel = { version = "2.2", features = ["postgres", "uuid", "chrono", "serde_jso
 diesel-async = { version = "0.5", features = ["postgres", "deadpool"] }
 deadpool = "0.12"
 futures-util = { version = "0.3", features = ["alloc"] }
+tokio-postgres = "0.7"
+tokio-postgres-rustls = "0.13"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "0.26"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -31,8 +35,9 @@ dotenvy = "0.15"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# Image processing
-image = "0.25"
+# Image processing - img_hash uses image <0.24 with default-features=false
+# We need to add the features explicitly for format support
+image = { version = "0.23", features = ["png", "jpeg"] }
 img_hash = "3"
 tempfile = "3"
 
@@ -41,6 +46,9 @@ regex-lite = "0.1"
 
 # Filesystem
 walkdir = "2"
+
+# Random
+rand = "0.9"
 
 # CLI
 clap = { version = "4", features = ["derive"] }

@@ -13,137 +13,345 @@
             color: #e0e0e0;
         }
         h1 { margin-bottom: 0.5rem; }
-        .cluster-name { color: #888; margin-bottom: 2rem; }
-        .files { display: flex; flex-direction: column; gap: 2rem; }
-        .file-card { background: #2a2a2a; border-radius: 8px; padding: 1.5rem; }
-        .file-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 1rem; }
-        .file-info h3 { margin: 0 0 0.5rem 0; word-break: break-all; }
-        .file-meta { color: #888; font-size: 0.9rem; }
-        .file-meta span { margin-right: 1rem; }
-        .quality-badge { background: #4a9eff; color: white; padding: 0.25rem 0.75rem; border-radius: 4px; font-weight: bold; white-space: nowrap; }
-        .thumbnails { display: flex; gap: 0.5rem; overflow-x: auto; padding: 0.5rem 0; }
-        .thumbnail { flex-shrink: 0; cursor: pointer; position: relative; }
-        .thumbnail img { height: 120px; border-radius: 4px; border: 2px solid transparent; }
+        .cluster-name { color: #888; margin-bottom: 1rem; }
+
+        .video-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
+            gap: 1rem;
+            margin-bottom: 2rem;
+        }
+        .video-panel {
+            background: #2a2a2a;
+            border-radius: 8px;
+            overflow: hidden;
+        }
+        .video-panel video {
+            width: 100%;
+            display: block;
+        }
+        .video-info {
+            padding: 0.75rem;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-size: 0.85rem;
+        }
+        .video-info .filename {
+            font-weight: bold;
+            word-break: break-all;
+            flex: 1;
+        }
+        .video-meta {
+            color: #888;
+            white-space: nowrap;
+            margin-left: 1rem;
+        }
+        .quality-badge {
+            background: #4a9eff;
+            color: white;
+            padding: 0.2rem 0.5rem;
+            border-radius: 4px;
+            font-size: 0.75rem;
+            font-weight: bold;
+            margin-left: 0.5rem;
+        }
+
+        .scrubber-container {
+            background: #2a2a2a;
+            border-radius: 8px;
+            padding: 1rem;
+            margin-bottom: 2rem;
+        }
+        .scrubber-label { color: #888; margin-bottom: 0.5rem; font-size: 0.9rem; }
+        .scrubber {
+            width: 100%;
+            height: 8px;
+            -webkit-appearance: none;
+            background: #444;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        .scrubber::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            width: 16px;
+            height: 16px;
+            background: #4a9eff;
+            border-radius: 50%;
+            cursor: pointer;
+        }
+        .time-display {
+            display: flex;
+            justify-content: space-between;
+            font-size: 0.85rem;
+            color: #888;
+            margin-top: 0.5rem;
+        }
+        .playback-controls {
+            display: flex;
+            gap: 0.5rem;
+            margin-top: 1rem;
+            justify-content: center;
+        }
+
+        .file-cards {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 1rem;
+        }
+        .file-card {
+            background: #2a2a2a;
+            border-radius: 8px;
+            padding: 1rem;
+        }
+        .file-card h3 {
+            margin: 0 0 0.5rem 0;
+            font-size: 0.9rem;
+            word-break: break-all;
+        }
+        .file-meta {
+            color: #888;
+            font-size: 0.8rem;
+            margin-bottom: 0.75rem;
+        }
+        .file-meta span { margin-right: 0.75rem; }
+
+        .thumbnails {
+            display: flex;
+            gap: 0.25rem;
+            overflow-x: auto;
+            padding: 0.25rem 0;
+            margin-bottom: 0.75rem;
+        }
+        .thumbnail {
+            flex-shrink: 0;
+            cursor: pointer;
+            position: relative;
+        }
+        .thumbnail img {
+            height: 60px;
+            border-radius: 2px;
+            border: 2px solid transparent;
+        }
         .thumbnail:hover img { border-color: #4a9eff; }
-        .thumbnail.selected img { border-color: #4aff4a; }
-        .thumbnail .timestamp { position: absolute; bottom: 4px; right: 4px; background: rgba(0,0,0,0.7); padding: 2px 6px; border-radius: 2px; font-size: 0.75rem; }
-        .file-actions { display: flex; gap: 0.5rem; margin-top: 1rem; }
-        button, .btn { padding: 0.75rem 1.5rem; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; text-decoration: none; display: inline-block; }
+        .thumbnail .timestamp {
+            position: absolute;
+            bottom: 2px;
+            right: 2px;
+            background: rgba(0,0,0,0.7);
+            padding: 1px 4px;
+            border-radius: 2px;
+            font-size: 0.65rem;
+        }
+
+        button, .btn {
+            padding: 0.5rem 1rem;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-weight: bold;
+            text-decoration: none;
+            display: inline-block;
+            font-size: 0.9rem;
+        }
         .btn-keep { background: #4aff4a; color: #1a1a1a; }
         .btn-skip { background: #666; color: white; }
         .btn-play { background: #4a9eff; color: white; }
+        .btn-delete { background: #ff4a4a; color: white; }
         button:hover, .btn:hover { opacity: 0.9; }
-        .bounds-controls { margin-top: 1rem; padding-top: 1rem; border-top: 1px solid #444; }
-        .bounds-controls label { display: block; margin-bottom: 0.5rem; color: #888; }
-        .bounds-row { display: flex; gap: 1rem; align-items: center; }
-        .bounds-row span { color: #888; }
-        video { max-width: 100%; margin-top: 1rem; border-radius: 4px; display: none; }
-        video.visible { display: block; }
+
+        .file-actions {
+            display: flex;
+            gap: 0.5rem;
+            flex-wrap: wrap;
+        }
+
+        .global-actions {
+            margin-top: 2rem;
+            padding-top: 1rem;
+            border-top: 1px solid #444;
+            display: flex;
+            gap: 1rem;
+        }
     </style>
 </head>
 <body>
     <h1>Review Cluster</h1>
     <p class="cluster-name">{% match cluster.name %}{% when Some with (name) %}{{ name }}{% when None %}Unnamed Cluster{% endmatch %} ({{ files.len() }} files)</p>
 
-    <div class="files">
+    <div class="video-grid">
+        {% for f in files %}
+        <div class="video-panel">
+            <video id="video-{{ f.file.id }}" preload="metadata" data-file-id="{{ f.file.id }}">
+                <source src="/media/{{ f.relative_path }}" type="video/mp4">
+            </video>
+            <div class="video-info">
+                <span class="filename">{{ f.filename }}</span>
+                <span class="video-meta">
+                    {{ f.resolution }} · {{ f.size_mb }} MB
+                </span>
+                {% if loop.first %}<span class="quality-badge">Best</span>{% endif %}
+            </div>
+        </div>
+        {% endfor %}
+    </div>
+
+    <div class="scrubber-container">
+        <div class="scrubber-label">Synced Playback</div>
+        <input type="range" class="scrubber" id="globalScrubber" min="0" max="100" value="0" step="0.1">
+        <div class="time-display">
+            <span id="currentTime">0:00</span>
+            <span id="totalTime">0:00</span>
+        </div>
+        <div class="playback-controls">
+            <button class="btn-play" onclick="togglePlayAll()" id="playBtn">▶ Play All</button>
+            <button class="btn-skip" onclick="skipTime(-10)">-10s</button>
+            <button class="btn-skip" onclick="skipTime(-5)">-5s</button>
+            <button class="btn-skip" onclick="skipTime(5)">+5s</button>
+            <button class="btn-skip" onclick="skipTime(10)">+10s</button>
+            <button class="btn-sync" onclick="toggleSync()" id="syncBtn" style="background:#4aff4a;color:#1a1a1a;">🔒 Synced</button>
+        </div>
+    </div>
+
+    <div class="file-cards">
         {% for f in files %}
         <div class="file-card" data-file-id="{{ f.file.id }}">
-            <div class="file-header">
-                <div class="file-info">
-                    <h3>{{ f.filename }}</h3>
-                    <div class="file-meta">
-                        {% if !f.resolution.is_empty() %}<span>{{ f.resolution }}</span>{% endif %}
-                        {% if !f.bitrate_kbps.is_empty() %}<span>{{ f.bitrate_kbps }}</span>{% endif %}
-                        <span>{{ f.size_mb }} MB</span>
-                        {% if !f.duration_display.is_empty() %}<span>{{ f.duration_display }}</span>{% endif %}
-                    </div>
-                </div>
-                {% if loop.first %}
-                <span class="quality-badge">Best Quality</span>
-                {% endif %}
+            <h3>{{ f.filename }}</h3>
+            <div class="file-meta">
+                {% if !f.resolution.is_empty() %}<span>{{ f.resolution }}</span>{% endif %}
+                {% if !f.bitrate_kbps.is_empty() %}<span>{{ f.bitrate_kbps }}</span>{% endif %}
+                <span>{{ f.size_mb }} MB</span>
+                {% if !f.duration_display.is_empty() %}<span>{{ f.duration_display }}</span>{% endif %}
             </div>
 
             <div class="thumbnails">
                 {% for thumb in f.thumbnails %}
-                <div class="thumbnail" data-timestamp="{{ thumb.timestamp_ms }}" onclick="selectThumbnail(this, '{{ f.file.id }}')">
+                <div class="thumbnail" data-timestamp="{{ thumb.timestamp_ms }}" onclick="seekToTimestamp({{ thumb.timestamp_ms }})">
                     <img src="/thumbnails/{{ thumb.filename }}" alt="Frame at {{ thumb.timestamp_ms }}ms">
                     <span class="timestamp">{{ thumb.timestamp_secs }}s</span>
                 </div>
                 {% endfor %}
             </div>
 
-            <video id="video-{{ f.file.id }}" controls preload="none">
-                <source src="/media/{{ f.relative_path }}" type="video/mp4">
-            </video>
-
             <div class="file-actions">
                 <form method="post" action="/review/{{ cluster.id }}/decide" style="display:inline;">
                     <input type="hidden" name="kept_file_id" value="{{ f.file.id }}">
-                    <button type="submit" class="btn-keep">Keep</button>
+                    <button type="submit" class="btn-keep">Keep This</button>
                 </form>
-                <button class="btn-play" onclick="toggleVideo('{{ f.file.id }}')">Play</button>
-            </div>
-
-            <div class="bounds-controls">
-                <label>Content bounds (click thumbnails to set)</label>
-                <div class="bounds-row">
-                    <span>Start:</span>
-                    <input type="number" id="start-{{ f.file.id }}" placeholder="auto" style="width:100px">
-                    <span>End:</span>
-                    <input type="number" id="end-{{ f.file.id }}" placeholder="auto" style="width:100px">
-                    <button onclick="saveBounds('{{ f.file.id }}')" class="btn-skip">Save Bounds</button>
-                </div>
             </div>
         </div>
         {% endfor %}
     </div>
 
-    <div style="margin-top: 2rem; padding-top: 2rem; border-top: 1px solid #444;">
+    <div class="global-actions">
         <form method="post" action="/review/{{ cluster.id }}/skip">
-            <button type="submit" class="btn-skip">Skip (Different Thumbnails)</button>
+            <button type="submit" class="btn-skip">Skip (Regenerate Thumbnails)</button>
         </form>
     </div>
 
     <script>
-        let selectedStart = {};
-        let selectedEnd = {};
+        const videos = document.querySelectorAll('video');
+        const scrubber = document.getElementById('globalScrubber');
+        const currentTimeDisplay = document.getElementById('currentTime');
+        const totalTimeDisplay = document.getElementById('totalTime');
+        let maxDuration = 0;
+        let isPlaying = false;
+        let isSeeking = false;
+        let isSynced = true;
 
-        function selectThumbnail(el, fileId) {
-            const timestamp = parseInt(el.dataset.timestamp);
-            const isShift = event.shiftKey;
-
-            if (isShift) {
-                selectedEnd[fileId] = timestamp;
-                document.getElementById('end-' + fileId).value = timestamp;
-            } else {
-                selectedStart[fileId] = timestamp;
-                document.getElementById('start-' + fileId).value = timestamp;
-            }
-
-            const card = el.closest('.file-card');
-            card.querySelectorAll('.thumbnail').forEach(t => t.classList.remove('selected'));
-            el.classList.add('selected');
-        }
-
-        function toggleVideo(fileId) {
-            const video = document.getElementById('video-' + fileId);
-            video.classList.toggle('visible');
-            if (video.classList.contains('visible')) {
-                video.play();
-            } else {
-                video.pause();
-            }
-        }
-
-        function saveBounds(fileId) {
-            const start = document.getElementById('start-' + fileId).value || null;
-            const end = document.getElementById('end-' + fileId).value || null;
-
-            fetch('/file/' + fileId + '/set-bounds', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-                body: 'content_start_ms=' + (start || '') + '&content_end_ms=' + (end || '')
+        // Get max duration once videos load metadata
+        videos.forEach(video => {
+            video.addEventListener('loadedmetadata', () => {
+                if (video.duration > maxDuration) {
+                    maxDuration = video.duration;
+                    scrubber.max = maxDuration;
+                    totalTimeDisplay.textContent = formatTime(maxDuration);
+                }
             });
+
+            // Sync on timeupdate from any video
+            video.addEventListener('timeupdate', () => {
+                if (!isSeeking && video === videos[0]) {
+                    scrubber.value = video.currentTime;
+                    currentTimeDisplay.textContent = formatTime(video.currentTime);
+                }
+            });
+        });
+
+        // Scrubber input syncs all videos (only when synced)
+        scrubber.addEventListener('input', () => {
+            isSeeking = true;
+            const time = parseFloat(scrubber.value);
+            if (isSynced) {
+                videos.forEach(video => {
+                    video.currentTime = Math.min(time, video.duration || time);
+                });
+            } else {
+                videos[0].currentTime = Math.min(time, videos[0].duration || time);
+            }
+            currentTimeDisplay.textContent = formatTime(time);
+        });
+
+        scrubber.addEventListener('change', () => {
+            isSeeking = false;
+        });
+
+        function togglePlayAll() {
+            const targetVideos = isSynced ? videos : [videos[0]];
+            if (isPlaying) {
+                targetVideos.forEach(video => video.pause());
+                isPlaying = false;
+                document.getElementById('playBtn').textContent = '▶ Play' + (isSynced ? ' All' : '');
+            } else {
+                targetVideos.forEach(video => video.play());
+                isPlaying = true;
+                document.getElementById('playBtn').textContent = '⏸ Pause' + (isSynced ? ' All' : '');
+            }
+        }
+
+        function skipTime(seconds) {
+            const newTime = Math.max(0, parseFloat(scrubber.value) + seconds);
+            scrubber.value = newTime;
+            const targetVideos = isSynced ? videos : [videos[0]];
+            targetVideos.forEach(video => {
+                video.currentTime = Math.min(newTime, video.duration || newTime);
+            });
+            currentTimeDisplay.textContent = formatTime(newTime);
+        }
+
+        function seekToTimestamp(ms) {
+            const time = ms / 1000;
+            scrubber.value = time;
+            const targetVideos = isSynced ? videos : [videos[0]];
+            targetVideos.forEach(video => {
+                video.currentTime = Math.min(time, video.duration || time);
+            });
+            currentTimeDisplay.textContent = formatTime(time);
+        }
+
+        function formatTime(seconds) {
+            const mins = Math.floor(seconds / 60);
+            const secs = Math.floor(seconds % 60);
+            return mins + ':' + secs.toString().padStart(2, '0');
+        }
+
+        function toggleSync() {
+            isSynced = !isSynced;
+            const btn = document.getElementById('syncBtn');
+            if (isSynced) {
+                btn.textContent = '🔒 Synced';
+                btn.style.background = '#4aff4a';
+                btn.style.color = '#1a1a1a';
+                // Re-sync all videos to first video's position
+                const time = videos[0].currentTime;
+                videos.forEach(video => {
+                    video.currentTime = Math.min(time, video.duration || time);
+                });
+            } else {
+                btn.textContent = '🔓 Independent';
+                btn.style.background = '#666';
+                btn.style.color = 'white';
+            }
         }
     </script>
 </body>

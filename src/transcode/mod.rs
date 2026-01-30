@@ -38,11 +38,17 @@ impl Transcoder {
         }
     }
 
-    pub fn transcoding_path(original: &Path) -> PathBuf {
-        let mut path = original.to_path_buf();
-        let stem = path.file_stem().unwrap_or_default().to_string_lossy();
-        path.set_file_name(format!("{}.transcoding", stem));
-        path
+    pub fn transcoding_path(original: &Path, temp_dir: Option<&Path>) -> PathBuf {
+        let stem = original.file_stem().unwrap_or_default().to_string_lossy();
+        let filename = format!("{}.transcoding", stem);
+        match temp_dir {
+            Some(dir) => dir.join(filename),
+            None => {
+                let mut path = original.to_path_buf();
+                path.set_file_name(filename);
+                path
+            }
+        }
     }
 
     pub fn final_path(original: &Path, container: &str) -> PathBuf {
@@ -56,8 +62,9 @@ impl Transcoder {
         input: &Path,
         content_start_ms: Option<i32>,
         content_end_ms: Option<i32>,
+        temp_dir: Option<&Path>,
     ) -> Result<TranscodeResult> {
-        let transcoding_path = Self::transcoding_path(input);
+        let transcoding_path = Self::transcoding_path(input, temp_dir);
         let final_path = Self::final_path(input, &self.config.container);
 
         // Build ffmpeg command
@@ -97,6 +104,15 @@ impl Transcoder {
         // Audio codec
         cmd.args(["-c:a", &self.config.audio_codec, "-b:a", "128k"]);
 
+        // Output format (needed since .transcoding isn't a known extension)
+        let format = match self.config.container.as_str() {
+            "mkv" => "matroska",
+            "mp4" => "mp4",
+            "webm" => "webm",
+            other => other,
+        };
+        cmd.args(["-f", format]);
+
         // Output
         cmd.arg(&transcoding_path);
 
@@ -121,25 +137,83 @@ impl Transcoder {
         })
     }
 
-    pub fn verify(&self, original: &Path, transcoded: &Path) -> Result<VerifyResult> {
-        // Sample 5 frames from each and compare hashes
-        let duration = self.get_duration(original)?;
-        let timestamps = crate::scanner::fingerprint::generate_sample_timestamps(duration, 5);
+    fn get_fps(&self, path: &Path) -> Result<f64> {
+        let output = Command::new("ffprobe")
+            .args([
+                "-v", "quiet",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=r_frame_rate",
+                "-of", "csv=p=0",
+            ])
+            .arg(path)
+            .output()
+            .context("Failed to run ffprobe")?;
 
-        let original_hashes = self.fingerprinter.extract_frame_hashes(original, &timestamps)?;
-        let transcoded_hashes = self.fingerprinter.extract_frame_hashes(transcoded, &timestamps)?;
+        let fps_output = String::from_utf8_lossy(&output.stdout);
+        let fps_str = fps_output.lines().next().unwrap_or("30").trim();
+        // r_frame_rate is a fraction like "30000/1001"
+        if let Some((num, den)) = fps_str.split_once('/') {
+            let n: f64 = num.parse().unwrap_or(30.0);
+            let d: f64 = den.parse().unwrap_or(1.0);
+            Ok(n / d)
+        } else {
+            Ok(fps_str.parse().unwrap_or(30.0))
+        }
+    }
+
+    pub fn verify(&self, original: &Path, transcoded: &Path) -> Result<VerifyResult> {
+        let duration = self.get_duration(original)?;
+        let fps = self.get_fps(original)?;
+        let total_frames = (duration as f64 / 1000.0 * fps) as u64;
+
+        // Sample 5 frame numbers spread across the middle 80%
+        let start_frame = total_frames / 10;
+        let end_frame = total_frames - (total_frames / 10);
+        let usable = end_frame - start_frame;
+        let interval = usable / 6;
+        let frame_numbers: Vec<u64> = (1..=5)
+            .map(|i| start_frame + (interval * i))
+            .collect();
+
+        tracing::debug!(
+            "Verifying: duration={}ms, fps={:.2}, total_frames={}, sample_frames={:?}",
+            duration,
+            fps,
+            total_frames,
+            frame_numbers
+        );
+
+        let original_hashes = self.fingerprinter.extract_frame_hashes_by_number(original, &frame_numbers)?;
+        let transcoded_hashes = self.fingerprinter.extract_frame_hashes_by_number(transcoded, &frame_numbers)?;
+
+        tracing::debug!(
+            "Extracted {} original frames, {} transcoded frames",
+            original_hashes.len(),
+            transcoded_hashes.len()
+        );
 
         if original_hashes.len() != transcoded_hashes.len() {
             return Ok(VerifyResult {
                 passed: false,
                 similarity: 0.0,
-                message: "Different number of frames extracted".to_string(),
+                message: format!(
+                    "Different number of frames extracted: {} vs {}",
+                    original_hashes.len(),
+                    transcoded_hashes.len()
+                ),
             });
         }
 
         let mut total_similarity = 0.0;
-        for ((_, orig_hash), (_, trans_hash)) in original_hashes.iter().zip(transcoded_hashes.iter()) {
-            total_similarity += Fingerprinter::similarity(orig_hash, trans_hash);
+        for ((orig_fn, orig_hash), (trans_fn, trans_hash)) in original_hashes.iter().zip(transcoded_hashes.iter()) {
+            let sim = Fingerprinter::similarity(orig_hash, trans_hash);
+            tracing::debug!(
+                "Frame #{} vs #{}: {:.1}% similarity",
+                orig_fn,
+                trans_fn,
+                sim * 100.0
+            );
+            total_similarity += sim;
         }
 
         let avg_similarity = if original_hashes.is_empty() {
@@ -166,9 +240,17 @@ impl Transcoder {
     }
 
     pub fn finalize(&self, result: &TranscodeResult, original: &Path) -> Result<()> {
-        // Rename transcoding file to final name
-        std::fs::rename(&result.transcoding_path, &result.final_path)
-            .context("Failed to rename transcoded file")?;
+        // Move transcoding file to final name (try rename, fall back to copy+delete for cross-filesystem)
+        if let Err(rename_err) = std::fs::rename(&result.transcoding_path, &result.final_path) {
+            tracing::debug!(
+                "Rename failed ({}), falling back to copy+delete",
+                rename_err
+            );
+            std::fs::copy(&result.transcoding_path, &result.final_path)
+                .context("Failed to copy transcoded file to final location")?;
+            std::fs::remove_file(&result.transcoding_path)
+                .context("Failed to remove temporary transcoded file")?;
+        }
 
         // Delete original
         std::fs::remove_file(original).context("Failed to delete original file")?;

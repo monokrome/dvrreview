@@ -111,7 +111,23 @@ impl FromSql<Text, Pg> for TranscodeStatus {
 }
 
 #[derive(Debug, Clone, Queryable, Selectable, Identifiable, Serialize)]
+#[diesel(table_name = crate::db::schema::dvrs)]
+pub struct Dvr {
+    pub id: Uuid,
+    pub name: String,
+    pub created_at: DateTime<Utc>,
+    pub last_verified_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Insertable)]
+#[diesel(table_name = crate::db::schema::dvrs)]
+pub struct NewDvr {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Queryable, Selectable, Identifiable, Associations, Serialize)]
 #[diesel(table_name = crate::db::schema::files)]
+#[diesel(belongs_to(Dvr))]
 pub struct File {
     pub id: Uuid,
     pub path: String,
@@ -134,6 +150,8 @@ pub struct File {
     pub transcoded_at: Option<DateTime<Utc>>,
     pub original_size_bytes: Option<i64>,
     pub transcode_status: TranscodeStatus,
+    pub dvr_id: Option<Uuid>,
+    pub relative_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Insertable)]
@@ -150,6 +168,8 @@ pub struct NewFile {
     pub claimed_title: Option<String>,
     pub claimed_season: Option<i32>,
     pub claimed_episode: Option<i32>,
+    pub dvr_id: Option<Uuid>,
+    pub relative_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Queryable, Selectable, Identifiable, Serialize)]

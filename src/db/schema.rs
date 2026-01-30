@@ -1,8 +1,6 @@
 // @generated automatically by Diesel CLI.
 
 diesel::table! {
-    use diesel::sql_types::*;
-
     cluster_members (cluster_id, file_id) {
         cluster_id -> Uuid,
         file_id -> Uuid,
@@ -12,8 +10,6 @@ diesel::table! {
 }
 
 diesel::table! {
-    use diesel::sql_types::*;
-
     clusters (id) {
         id -> Uuid,
         name -> Nullable<Text>,
@@ -22,8 +18,15 @@ diesel::table! {
 }
 
 diesel::table! {
-    use diesel::sql_types::*;
+    dvrs (id) {
+        id -> Uuid,
+        name -> Text,
+        created_at -> Timestamptz,
+        last_verified_at -> Nullable<Timestamptz>,
+    }
+}
 
+diesel::table! {
     files (id) {
         id -> Uuid,
         path -> Text,
@@ -46,12 +49,12 @@ diesel::table! {
         transcoded_at -> Nullable<Timestamptz>,
         original_size_bytes -> Nullable<Int8>,
         transcode_status -> Text,
+        dvr_id -> Nullable<Uuid>,
+        relative_path -> Nullable<Text>,
     }
 }
 
 diesel::table! {
-    use diesel::sql_types::*;
-
     fingerprints (id) {
         id -> Uuid,
         file_id -> Uuid,
@@ -62,8 +65,6 @@ diesel::table! {
 }
 
 diesel::table! {
-    use diesel::sql_types::*;
-
     reviews (id) {
         id -> Uuid,
         cluster_id -> Uuid,
@@ -76,8 +77,6 @@ diesel::table! {
 }
 
 diesel::table! {
-    use diesel::sql_types::*;
-
     thumbnails (id) {
         id -> Uuid,
         file_id -> Uuid,
@@ -88,13 +87,16 @@ diesel::table! {
 
 diesel::joinable!(cluster_members -> clusters (cluster_id));
 diesel::joinable!(cluster_members -> files (file_id));
+diesel::joinable!(files -> dvrs (dvr_id));
 diesel::joinable!(fingerprints -> files (file_id));
 diesel::joinable!(reviews -> clusters (cluster_id));
+diesel::joinable!(reviews -> files (kept_file_id));
 diesel::joinable!(thumbnails -> files (file_id));
 
 diesel::allow_tables_to_appear_in_same_query!(
     cluster_members,
     clusters,
+    dvrs,
     files,
     fingerprints,
     reviews,

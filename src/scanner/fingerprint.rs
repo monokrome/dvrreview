@@ -28,42 +28,132 @@ impl Fingerprinter {
         video_path: &Path,
         timestamps_ms: &[i32],
     ) -> Result<Vec<(i32, Vec<u8>)>> {
+        self.extract_frame_hashes_inner(video_path, timestamps_ms, false)
+    }
+
+    pub fn extract_frame_hashes_accurate(
+        &self,
+        video_path: &Path,
+        timestamps_ms: &[i32],
+    ) -> Result<Vec<(i32, Vec<u8>)>> {
+        self.extract_frame_hashes_inner(video_path, timestamps_ms, true)
+    }
+
+    fn extract_frame_hashes_inner(
+        &self,
+        video_path: &Path,
+        timestamps_ms: &[i32],
+        accurate_seek: bool,
+    ) -> Result<Vec<(i32, Vec<u8>)>> {
         let temp_dir = TempDir::new().context("Failed to create temp directory")?;
         let mut results = Vec::new();
+
+        if !video_path.exists() {
+            tracing::warn!("Video file does not exist: {:?}", video_path);
+            return Ok(results);
+        }
 
         for &ts_ms in timestamps_ms {
             let ts_secs = ts_ms as f64 / 1000.0;
             let frame_path = temp_dir.path().join(format!("frame_{}.png", ts_ms));
 
-            let status = Command::new("ffmpeg")
-                .args(["-ss", &format!("{:.3}", ts_secs), "-i"])
-                .arg(video_path)
+            let mut cmd = Command::new("ffmpeg");
+            if accurate_seek {
+                // -ss after -i: decodes from start, accurate but slower
+                cmd.arg("-i")
+                    .arg(video_path)
+                    .args(["-ss", &format!("{:.3}", ts_secs)]);
+            } else {
+                // -ss before -i: keyframe seek, fast but depends on container timestamps
+                cmd.args(["-ss", &format!("{:.3}", ts_secs), "-i"])
+                    .arg(video_path);
+            }
+            let output = cmd
                 .args([
-                    "-vframes",
-                    "1",
-                    "-vf",
-                    "crop=iw*0.8:ih*0.8:iw*0.1:ih*0.1",
+                    "-vframes", "1",
+                    "-vf", "crop=iw*0.8:ih*0.8:iw*0.1:ih*0.1",
                     "-y",
                 ])
                 .arg(&frame_path)
-                .stderr(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
                 .output()
                 .context("Failed to run ffmpeg")?;
 
-            if !status.status.success() {
-                tracing::warn!(
-                    "Failed to extract frame at {}ms from {:?}",
-                    ts_ms,
-                    video_path
-                );
+            if !output.status.success() {
                 continue;
             }
 
-            // Use img_hash's bundled image crate
+            if !frame_path.exists() {
+                continue;
+            }
+
             if let Ok(img) = img_hash::image::open(&frame_path) {
                 let hash = self.hasher.hash_image(&img);
                 results.push((ts_ms, hash.as_bytes().to_vec()));
+            }
+        }
+
+        Ok(results)
+    }
+
+    pub fn extract_frame_hashes_by_number(
+        &self,
+        video_path: &Path,
+        frame_numbers: &[u64],
+    ) -> Result<Vec<(u64, Vec<u8>)>> {
+        let temp_dir = TempDir::new().context("Failed to create temp directory")?;
+        let mut results = Vec::new();
+
+        if !video_path.exists() {
+            tracing::warn!("Video file does not exist: {:?}", video_path);
+            return Ok(results);
+        }
+
+        // Build select expression: select='eq(n,100)+eq(n,200)+...'
+        let select_expr: String = frame_numbers
+            .iter()
+            .map(|n| format!("eq(n\\,{})", n))
+            .collect::<Vec<_>>()
+            .join("+");
+
+        let vf = format!(
+            "select='{}',crop=iw*0.8:ih*0.8:iw*0.1:ih*0.1",
+            select_expr
+        );
+        let output_pattern = temp_dir.path().join("frame_%04d.png");
+
+        let output = Command::new("ffmpeg")
+            .args(["-i"])
+            .arg(video_path)
+            .args([
+                "-vf", &vf,
+                "-vsync", "vfr",
+                "-frames:v", &frame_numbers.len().to_string(),
+                "-y",
+            ])
+            .arg(&output_pattern)
+            .output()
+            .context("Failed to run ffmpeg")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            tracing::warn!(
+                "Failed to extract frames from {:?}: {}",
+                video_path,
+                stderr.lines().last().unwrap_or("unknown error")
+            );
+            return Ok(results);
+        }
+
+        for (idx, &frame_num) in frame_numbers.iter().enumerate() {
+            let frame_path = temp_dir.path().join(format!("frame_{:04}.png", idx + 1));
+
+            if !frame_path.exists() {
+                continue;
+            }
+
+            if let Ok(img) = img_hash::image::open(&frame_path) {
+                let hash = self.hasher.hash_image(&img);
+                results.push((frame_num, hash.as_bytes().to_vec()));
             }
         }
 
@@ -84,6 +174,10 @@ impl Fingerprinter {
         let distance = Self::hamming_distance(a, b);
         let max_distance = (a.len() * 8) as f32;
         1.0 - (distance as f32 / max_distance)
+    }
+
+    pub fn compare_hashes(&self, a: &[u8], b: &[u8]) -> f32 {
+        Self::similarity(a, b)
     }
 }
 
