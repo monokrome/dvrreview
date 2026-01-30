@@ -1,0 +1,15 @@
+services:
+  dvrreview:
+    build: .
+    environment:
+      - DATABASE_URL=${DATABASE_URL}
+    volumes:
+      # Mount your DVR directory
+      - /path/to/dvr:/data/dvr:rw
+      # Mount thumbnails output directory
+      - /path/to/thumbnails:/data/thumbnails:rw
+    ports:
+      # Web UI port (when running serve)
+      - "3000:3000"
+    # Override command as needed, e.g.:
+    # command: ["mydvr", "/data/dvr", "scan"]

@@ -1,0 +1,5 @@
+DROP INDEX IF EXISTS idx_dvrs_name;
+DROP INDEX IF EXISTS idx_files_dvr_id;
+ALTER TABLE files DROP COLUMN IF EXISTS relative_path;
+ALTER TABLE files DROP COLUMN IF EXISTS dvr_id;
+DROP TABLE IF EXISTS dvrs;
