@@ -227,7 +227,7 @@
             <div class="thumbnails">
                 {% for thumb in f.thumbnails %}
                 <div class="thumbnail" data-timestamp="{{ thumb.timestamp_ms }}" onclick="seekToTimestamp({{ thumb.timestamp_ms }})">
-                    <img src="/thumbnails/{{ thumb.filename }}" alt="Frame at {{ thumb.timestamp_ms }}ms">
+                    <img src="/thumbnail/{{ thumb.file_id }}/{{ thumb.timestamp_ms }}" loading="lazy" alt="Frame at {{ thumb.timestamp_ms }}ms">
                     <span class="timestamp">{{ thumb.timestamp_secs }}s</span>
                 </div>
                 {% endfor %}

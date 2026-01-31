@@ -35,6 +35,34 @@ pub enum TranscodeStatus {
     Failed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, FromSqlRow, AsExpression)]
+#[diesel(sql_type = Text)]
+pub enum MediaType {
+    Tv,
+    Movie,
+}
+
+impl ToSql<Text, Pg> for MediaType {
+    fn to_sql<'b>(&'b self, out: &mut Output<'b, '_, Pg>) -> serialize::Result {
+        let s = match self {
+            MediaType::Tv => "tv",
+            MediaType::Movie => "movie",
+        };
+        <str as ToSql<Text, Pg>>::to_sql(s, out)
+    }
+}
+
+impl FromSql<Text, Pg> for MediaType {
+    fn from_sql(bytes: PgValue<'_>) -> deserialize::Result<Self> {
+        let s = <String as FromSql<Text, Pg>>::from_sql(bytes)?;
+        match s.as_str() {
+            "tv" => Ok(MediaType::Tv),
+            "movie" => Ok(MediaType::Movie),
+            _ => Err(format!("Unknown media_type: {}", s).into()),
+        }
+    }
+}
+
 impl ToSql<Text, Pg> for FileStatus {
     fn to_sql<'b>(&'b self, out: &mut Output<'b, '_, Pg>) -> serialize::Result {
         let s = match self {
@@ -152,6 +180,11 @@ pub struct File {
     pub transcode_status: TranscodeStatus,
     pub dvr_id: Option<Uuid>,
     pub relative_path: Option<String>,
+    pub tmdb_id: Option<i32>,
+    pub tmdb_media_type: Option<MediaType>,
+    pub tmdb_title: Option<String>,
+    pub tmdb_year: Option<i32>,
+    pub identified_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Insertable)]
@@ -233,7 +266,7 @@ pub struct Thumbnail {
     pub id: Uuid,
     pub file_id: Uuid,
     pub timestamp_ms: i32,
-    pub path: String,
+    pub data: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Insertable)]
@@ -241,7 +274,7 @@ pub struct Thumbnail {
 pub struct NewThumbnail {
     pub file_id: Uuid,
     pub timestamp_ms: i32,
-    pub path: String,
+    pub data: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Queryable, Selectable, Identifiable, Associations, Serialize)]

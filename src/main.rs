@@ -3,7 +3,7 @@ use chrono::Utc;
 use clap::{Parser, Subcommand};
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
-use dvrreview::db::models::{Dvr, File, NewCluster, NewClusterMember, NewDvr, NewFile, NewFingerprint, NewThumbnail, TranscodeStatus};
+use dvrreview::db::models::{Dvr, File, MediaType, NewCluster, NewClusterMember, NewDvr, NewFile, NewFingerprint, NewThumbnail, TranscodeStatus};
 use dvrreview::db::schema::{cluster_members, clusters, dvrs, files, fingerprints, thumbnails};
 use dvrreview::db::{self, DbPool};
 use dvrreview::scanner::fingerprint::{generate_sample_timestamps, generate_thumbnail_timestamps, Fingerprinter};
@@ -54,15 +54,19 @@ enum Command {
         no_verify: bool,
     },
 
-    /// Generate thumbnail images for the review UI
+    /// Generate thumbnail images and store in DB for the review UI
     Thumbnails {
-        /// Output directory for thumbnails
-        #[arg(short, long)]
-        output: PathBuf,
-
         /// Number of thumbnails per file
         #[arg(short, long, default_value = "8")]
         count: usize,
+
+        /// Delete all thumbnails for this DVR from the database
+        #[arg(long)]
+        clear: bool,
+
+        /// Skip confirmation prompt when clearing
+        #[arg(long)]
+        force: bool,
     },
 
     /// Build clusters from fingerprints
@@ -78,9 +82,9 @@ enum Command {
         #[arg(short, long, default_value = "127.0.0.1:3000")]
         addr: SocketAddr,
 
-        /// Directory containing thumbnails
-        #[arg(short, long)]
-        thumbnails: PathBuf,
+        /// Persist on-the-fly thumbnails to the database
+        #[arg(short = 'p', long)]
+        preserve_thumbnails: bool,
     },
 
     /// Show statistics
@@ -117,6 +121,17 @@ enum Command {
         temp_dir: Option<PathBuf>,
     },
 
+    /// Look up files on TMDB to normalize titles for clustering
+    Identify {
+        /// Log matches without writing to DB
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Only process files without an existing identification
+        #[arg(long, default_value = "true")]
+        incremental: bool,
+    },
+
     /// Verify this is the correct DVR by checking fingerprints
     Verify,
 }
@@ -149,6 +164,9 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     let database_url = std::env::var("DATABASE_URL").context("DATABASE_URL must be set")?;
+
+    db::migrations::run_migrations(&database_url)?;
+
     let pool = db::create_pool(&database_url);
 
     // Canonicalize the base path
@@ -160,7 +178,7 @@ async fn main() -> Result<()> {
 
     // Get or create the DVR record
     // Skip verification for verify, stats commands, and when --no-verify is passed
-    let skip_verify = matches!(cli.command, Command::Verify | Command::Stats)
+    let skip_verify = matches!(cli.command, Command::Verify | Command::Stats | Command::Identify { .. })
         || matches!(cli.command, Command::Fingerprint { no_verify: true, .. })
         || matches!(cli.command, Command::Transcode { no_verify: true, .. });
     let ctx = get_or_create_dvr(&pool, &cli.name, &base_path, skip_verify).await?;
@@ -172,14 +190,18 @@ async fn main() -> Result<()> {
         Command::Fingerprint { samples, incremental, .. } => {
             generate_fingerprints(&pool, &ctx, samples, incremental).await?;
         }
-        Command::Thumbnails { output, count } => {
-            generate_thumbnails(&pool, &ctx, &output, count).await?;
+        Command::Thumbnails { count, clear, force } => {
+            if clear {
+                clear_thumbnails(&pool, &ctx, force).await?;
+            } else {
+                generate_thumbnails(&pool, &ctx, count).await?;
+            }
         }
         Command::Cluster { threshold } => {
             build_clusters(&pool, &ctx, threshold).await?;
         }
-        Command::Serve { addr, thumbnails } => {
-            dvrreview::web::run_server(pool, thumbnails, ctx.base_path.clone(), addr).await?;
+        Command::Serve { addr, preserve_thumbnails } => {
+            dvrreview::web::run_server(pool, ctx.base_path.clone(), addr, preserve_thumbnails).await?;
         }
         Command::Stats => {
             show_stats(&pool, &ctx).await?;
@@ -194,6 +216,9 @@ async fn main() -> Result<()> {
             temp_dir,
         } => {
             transcode_files(&pool, &ctx, crf, preset, hardware, kept_only, limit, !no_verify, temp_dir).await?;
+        }
+        Command::Identify { dry_run, incremental } => {
+            identify_files(&pool, &ctx, dry_run, incremental).await?;
         }
         Command::Verify => {
             verify_dvr(&pool, &ctx).await?;
@@ -659,9 +684,36 @@ async fn generate_fingerprints(pool: &DbPool, ctx: &DvrContext, samples: usize, 
     Ok(())
 }
 
-async fn generate_thumbnails(pool: &DbPool, ctx: &DvrContext, output_dir: &PathBuf, count: usize) -> Result<()> {
-    std::fs::create_dir_all(output_dir)?;
+async fn clear_thumbnails(pool: &DbPool, ctx: &DvrContext, force: bool) -> Result<()> {
+    if !force {
+        eprint!("Delete all thumbnails for DVR '{}'? (y/N) ", ctx.dvr.name);
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        if !input.trim().eq_ignore_ascii_case("y") {
+            println!("Aborted.");
+            return Ok(());
+        }
+    }
 
+    let mut conn = pool.get().await.context("Failed to get database connection")?;
+
+    let file_ids: Vec<Uuid> = files::table
+        .filter(files::dvr_id.eq(ctx.dvr.id))
+        .select(files::id)
+        .load(&mut conn)
+        .await?;
+
+    let deleted: usize = diesel::delete(
+        thumbnails::table.filter(thumbnails::file_id.eq_any(&file_ids)),
+    )
+    .execute(&mut conn)
+    .await?;
+
+    tracing::info!("Deleted {} thumbnails.", deleted);
+    Ok(())
+}
+
+async fn generate_thumbnails(pool: &DbPool, ctx: &DvrContext, count: usize) -> Result<()> {
     let mut conn = pool.get().await.context("Failed to get database connection")?;
 
     let files_needing_thumbs: Vec<File> = files::table
@@ -689,43 +741,26 @@ async fn generate_thumbnails(pool: &DbPool, ctx: &DvrContext, output_dir: &PathB
         };
 
         for ts in timestamps {
-            let ts_secs = ts as f64 / 1000.0;
-            let thumb_filename = format!("{}_{}.jpg", file.id, ts);
-            let thumb_path = output_dir.join(&thumb_filename);
-
-            let status = std::process::Command::new("ffmpeg")
-                .args([
-                    "-ss",
-                    &format!("{:.3}", ts_secs),
-                    "-i",
-                ])
-                .arg(&file_path)
-                .args([
-                    "-vframes",
-                    "1",
-                    "-vf",
-                    "scale=320:-1",
-                    "-y",
-                ])
-                .arg(&thumb_path)
-                .output();
-
-            if let Ok(output) = status {
-                if output.status.success() {
-                    let new_thumb = NewThumbnail {
-                        file_id: file.id,
-                        timestamp_ms: ts,
-                        path: thumb_path.to_string_lossy().to_string(),
-                    };
-
-                    diesel::insert_into(thumbnails::table)
-                        .values(&new_thumb)
-                        .on_conflict((thumbnails::file_id, thumbnails::timestamp_ms))
-                        .do_nothing()
-                        .execute(&mut conn)
-                        .await?;
+            let data = match dvrreview::thumbnail::extract_thumbnail(&file_path, ts).await {
+                Ok(d) => d,
+                Err(e) => {
+                    tracing::warn!("Failed to extract thumbnail at {}ms from {:?}: {}", ts, file_path, e);
+                    continue;
                 }
-            }
+            };
+
+            let new_thumb = NewThumbnail {
+                file_id: file.id,
+                timestamp_ms: ts,
+                data,
+            };
+
+            diesel::insert_into(thumbnails::table)
+                .values(&new_thumb)
+                .on_conflict((thumbnails::file_id, thumbnails::timestamp_ms))
+                .do_nothing()
+                .execute(&mut conn)
+                .await?;
         }
 
         if (i + 1) % 10 == 0 {
@@ -734,6 +769,125 @@ async fn generate_thumbnails(pool: &DbPool, ctx: &DvrContext, output_dir: &PathB
     }
 
     tracing::info!("Thumbnail generation complete.");
+    Ok(())
+}
+
+async fn identify_files(pool: &DbPool, ctx: &DvrContext, dry_run: bool, incremental: bool) -> Result<()> {
+    let api_key = std::env::var("TMDB_API_KEY")
+        .or_else(|_| std::env::var("TMDB_ACCESS_TOKEN"))
+        .context("TMDB_API_KEY or TMDB_ACCESS_TOKEN must be set")?;
+
+    let mut client = dvrreview::tmdb::TmdbClient::new(api_key)?;
+    let mut conn = pool.get().await.context("Failed to get database connection")?;
+
+    let files_to_identify: Vec<File> = if incremental {
+        files::table
+            .filter(files::dvr_id.eq(ctx.dvr.id))
+            .filter(files::identified_at.is_null())
+            .filter(files::claimed_title.is_not_null())
+            .load(&mut conn)
+            .await?
+    } else {
+        files::table
+            .filter(files::dvr_id.eq(ctx.dvr.id))
+            .filter(files::claimed_title.is_not_null())
+            .load(&mut conn)
+            .await?
+    };
+
+    if files_to_identify.is_empty() {
+        tracing::info!("No files to identify.");
+        return Ok(());
+    }
+
+    // Group by claimed_title to deduplicate API calls
+    let mut by_title: HashMap<String, Vec<&File>> = HashMap::new();
+    for file in &files_to_identify {
+        if let Some(ref title) = file.claimed_title {
+            by_title.entry(title.clone()).or_default().push(file);
+        }
+    }
+
+    tracing::info!(
+        "Identifying {} files ({} unique titles)",
+        files_to_identify.len(),
+        by_title.len()
+    );
+
+    let mut identified = 0;
+    let mut not_found = 0;
+
+    for (claimed_title, title_files) in &by_title {
+        let parsed = dvrreview::tmdb::parse_title(claimed_title);
+        let has_season = title_files.iter().any(|f| f.claimed_season.is_some());
+
+        let result = match client.search(&parsed.clean_title, parsed.year, has_season).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("TMDB lookup failed for {:?}: {}", claimed_title, e);
+                continue;
+            }
+        };
+
+        match result {
+            Some(ref tmdb) => {
+                let year_str = tmdb.year.map(|y| y.to_string()).unwrap_or_default();
+                tracing::info!(
+                    "{:?} -> {} ({}, {}, id={})",
+                    claimed_title,
+                    tmdb.title,
+                    tmdb.media_type,
+                    year_str,
+                    tmdb.id
+                );
+
+                if !dry_run {
+                    let media_type = match tmdb.media_type.as_str() {
+                        "tv" => MediaType::Tv,
+                        _ => MediaType::Movie,
+                    };
+
+                    for file in title_files {
+                        diesel::update(files::table.find(file.id))
+                            .set((
+                                files::tmdb_id.eq(tmdb.id),
+                                files::tmdb_media_type.eq(&media_type),
+                                files::tmdb_title.eq(&tmdb.title),
+                                files::tmdb_year.eq(tmdb.year),
+                                files::identified_at.eq(Utc::now()),
+                            ))
+                            .execute(&mut conn)
+                            .await?;
+                    }
+                }
+
+                identified += title_files.len();
+            }
+            None => {
+                tracing::info!("{:?} -> no match found", claimed_title);
+
+                if !dry_run {
+                    // Mark as identified (with null tmdb_id) so incremental skips them
+                    for file in title_files {
+                        diesel::update(files::table.find(file.id))
+                            .set(files::identified_at.eq(Utc::now()))
+                            .execute(&mut conn)
+                            .await?;
+                    }
+                }
+
+                not_found += title_files.len();
+            }
+        }
+    }
+
+    tracing::info!(
+        "Identification complete. {} identified, {} not found.{}",
+        identified,
+        not_found,
+        if dry_run { " (dry run)" } else { "" }
+    );
+
     Ok(())
 }
 
@@ -751,7 +905,11 @@ async fn build_clusters(pool: &DbPool, ctx: &DvrContext, threshold: f32) -> Resu
 
     let mut by_title: HashMap<String, Vec<File>> = HashMap::new();
     for file in all_files {
-        let key = file.claimed_title.clone().unwrap_or_else(|| "Unknown".to_string());
+        let key = if let Some(tmdb_id) = file.tmdb_id {
+            format!("tmdb:{}", tmdb_id)
+        } else {
+            format!("title:{}", file.claimed_title.as_deref().unwrap_or("Unknown"))
+        };
         by_title.entry(key).or_default().push(file);
     }
 

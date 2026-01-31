@@ -51,6 +51,11 @@ diesel::table! {
         transcode_status -> Text,
         dvr_id -> Nullable<Uuid>,
         relative_path -> Nullable<Text>,
+        tmdb_id -> Nullable<Int4>,
+        tmdb_media_type -> Nullable<Text>,
+        tmdb_title -> Nullable<Text>,
+        tmdb_year -> Nullable<Int4>,
+        identified_at -> Nullable<Timestamptz>,
     }
 }
 
@@ -81,7 +86,7 @@ diesel::table! {
         id -> Uuid,
         file_id -> Uuid,
         timestamp_ms -> Int4,
-        path -> Text,
+        data -> Bytea,
     }
 }
 

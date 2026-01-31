@@ -1,14 +1,18 @@
-use crate::db::models::{Cluster, ClusterMember, File, FileStatus, NewReview, ReviewDecision, Thumbnail};
+use crate::db::models::{Cluster, ClusterMember, File, FileStatus, NewReview, NewThumbnail, ReviewDecision, Thumbnail};
 use crate::db::schema::{cluster_members, clusters, files, reviews, thumbnails};
+use crate::scanner::fingerprint::generate_thumbnail_timestamps;
+use crate::thumbnail::extract_thumbnail;
 use crate::web::server::AppState;
 use askama::Template;
 use axum::extract::{Path, State};
+use axum::http::header;
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Form, Router};
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 use serde::Deserialize;
+use std::path::PathBuf;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -20,6 +24,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/review/{cluster_id}/decide", post(submit_decision))
         .route("/review/{cluster_id}/skip", post(skip_cluster))
         .route("/file/{file_id}/set-bounds", post(set_content_bounds))
+        .route("/thumbnail/{file_id}/{timestamp_ms}", get(serve_thumbnail))
 }
 
 #[derive(Template)]
@@ -71,10 +76,20 @@ async fn review_page(State(state): State<Arc<AppState>>) -> Response {
         Err(e) => return Html(format!("Database error: {}", e)).into_response(),
     };
 
-    // Find first unreviewed cluster
+    // Find unreviewed cluster IDs that have at least one transcoded file
+    let ready_cluster_ids: Vec<Uuid> = cluster_members::table
+        .inner_join(files::table)
+        .filter(files::transcode_status.eq(crate::db::models::TranscodeStatus::Completed))
+        .select(cluster_members::cluster_id)
+        .distinct()
+        .load(&mut conn)
+        .await
+        .unwrap_or_default();
+
     let cluster: Option<Cluster> = clusters::table
         .left_join(reviews::table)
         .filter(reviews::id.is_null())
+        .filter(clusters::id.eq_any(&ready_cluster_ids))
         .select(Cluster::as_select())
         .first(&mut conn)
         .await
@@ -106,9 +121,9 @@ struct FileWithThumbnails {
 }
 
 struct ThumbnailDisplay {
+    file_id: Uuid,
     timestamp_ms: i32,
     timestamp_secs: i32,
-    filename: String,
 }
 
 async fn review_cluster(
@@ -139,17 +154,25 @@ async fn review_cluster(
 
     let cluster_files: Vec<File> = files::table
         .filter(files::id.eq_any(&file_ids))
+        .filter(files::transcode_status.eq(crate::db::models::TranscodeStatus::Completed))
         .load(&mut conn)
         .await
         .unwrap_or_default();
 
     let mut files_with_thumbs = Vec::new();
     for file in cluster_files {
-        let thumbs: Vec<Thumbnail> = thumbnails::table
-            .filter(thumbnails::file_id.eq(file.id))
-            .order(thumbnails::timestamp_ms.asc())
-            .load(&mut conn)
-            .await
+        let thumb_displays: Vec<ThumbnailDisplay> = file
+            .duration_ms
+            .map(|d| {
+                generate_thumbnail_timestamps(d, 8)
+                    .into_iter()
+                    .map(|ts| ThumbnailDisplay {
+                        file_id: file.id,
+                        timestamp_ms: ts,
+                        timestamp_secs: ts / 1000,
+                    })
+                    .collect()
+            })
             .unwrap_or_default();
 
         let relative_path = file
@@ -183,23 +206,6 @@ async fn review_cluster(
             .map(|d| format!("{}:{:02}", d / 60000, (d % 60000) / 1000))
             .unwrap_or_default();
 
-        let thumb_displays: Vec<ThumbnailDisplay> = thumbs
-            .iter()
-            .map(|t| {
-                let thumb_filename = t
-                    .path
-                    .rsplit('/')
-                    .next()
-                    .unwrap_or(&t.path)
-                    .to_string();
-                ThumbnailDisplay {
-                    timestamp_ms: t.timestamp_ms,
-                    timestamp_secs: t.timestamp_ms / 1000,
-                    filename: thumb_filename,
-                }
-            })
-            .collect();
-
         files_with_thumbs.push(FileWithThumbnails {
             file,
             thumbnails: thumb_displays,
@@ -220,6 +226,15 @@ async fn review_cluster(
             (b.file.width.unwrap_or(0) * b.file.height.unwrap_or(0)) as i64 * b.file.bitrate.unwrap_or(0) as i64;
         quality_b.cmp(&quality_a)
     });
+
+    if files_with_thumbs.is_empty() {
+        return Html(format!(
+            "<h1>Cluster not ready</h1><p>No transcoded files available for cluster \"{}\". \
+             Transcode files first, then review.</p><p><a href=\"/\">Back to home</a></p>",
+            cluster.name.as_deref().unwrap_or("Unnamed")
+        ))
+        .into_response();
+    }
 
     let template = ReviewTemplate {
         cluster,
@@ -355,4 +370,76 @@ async fn set_content_bounds(
         .await;
 
     Html("OK").into_response()
+}
+
+async fn serve_thumbnail(
+    State(state): State<Arc<AppState>>,
+    Path((file_id, timestamp_ms)): Path<(Uuid, i32)>,
+) -> Response {
+    let mut conn = match state.pool.get().await {
+        Ok(c) => c,
+        Err(e) => return Html(format!("Database error: {}", e)).into_response(),
+    };
+
+    // Check DB for existing thumbnail
+    let existing: Option<Thumbnail> = thumbnails::table
+        .filter(thumbnails::file_id.eq(file_id))
+        .filter(thumbnails::timestamp_ms.eq(timestamp_ms))
+        .first(&mut conn)
+        .await
+        .ok();
+
+    if let Some(thumb) = existing {
+        return (
+            [
+                (header::CONTENT_TYPE, "image/jpeg"),
+                (header::CACHE_CONTROL, "public, max-age=86400"),
+            ],
+            thumb.data,
+        )
+            .into_response();
+    }
+
+    // Not in DB — generate on the fly
+    let file: File = match files::table.find(file_id).first(&mut conn).await {
+        Ok(f) => f,
+        Err(_) => return (axum::http::StatusCode::NOT_FOUND, "File not found").into_response(),
+    };
+
+    let video_path = match &file.relative_path {
+        Some(rel) => state.media_root.join(rel),
+        None => PathBuf::from(&file.path),
+    };
+
+    let data = match extract_thumbnail(&video_path, timestamp_ms).await {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!("Thumbnail extraction failed for {}@{}ms: {}", file_id, timestamp_ms, e);
+            return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "Thumbnail generation failed").into_response();
+        }
+    };
+
+    if state.preserve_thumbnails {
+        let new_thumb = NewThumbnail {
+            file_id,
+            timestamp_ms,
+            data: data.clone(),
+        };
+
+        let _ = diesel::insert_into(thumbnails::table)
+            .values(&new_thumb)
+            .on_conflict((thumbnails::file_id, thumbnails::timestamp_ms))
+            .do_nothing()
+            .execute(&mut conn)
+            .await;
+    }
+
+    (
+        [
+            (header::CONTENT_TYPE, "image/jpeg"),
+            (header::CACHE_CONTROL, "public, max-age=86400"),
+        ],
+        data,
+    )
+        .into_response()
 }

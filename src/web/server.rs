@@ -9,25 +9,24 @@ use tower_http::services::ServeDir;
 #[derive(Clone)]
 pub struct AppState {
     pub pool: DbPool,
-    pub thumbnail_dir: PathBuf,
     pub media_root: PathBuf,
+    pub preserve_thumbnails: bool,
 }
 
 pub async fn run_server(
     pool: DbPool,
-    thumbnail_dir: PathBuf,
     media_root: PathBuf,
     addr: SocketAddr,
+    preserve_thumbnails: bool,
 ) -> anyhow::Result<()> {
     let state = Arc::new(AppState {
         pool,
-        thumbnail_dir: thumbnail_dir.clone(),
         media_root: media_root.clone(),
+        preserve_thumbnails,
     });
 
     let app = Router::new()
         .merge(routes::router())
-        .nest_service("/thumbnails", ServeDir::new(&thumbnail_dir))
         .nest_service("/media", ServeDir::new(&media_root))
         .with_state(state);
 
