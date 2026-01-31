@@ -1,6 +1,0 @@
-DROP TABLE IF EXISTS thumbnails;
-DROP TABLE IF EXISTS reviews;
-DROP TABLE IF EXISTS cluster_members;
-DROP TABLE IF EXISTS clusters;
-DROP TABLE IF EXISTS fingerprints;
-DROP TABLE IF EXISTS files;
