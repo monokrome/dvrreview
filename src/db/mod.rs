@@ -15,7 +15,7 @@ use tokio_postgres_rustls::MakeRustlsConnect;
 
 pub type DbPool = Pool<AsyncPgConnection>;
 
-fn make_tls_connector() -> MakeRustlsConnect {
+pub(crate) fn make_tls_connector() -> MakeRustlsConnect {
     let mut root_store = rustls::RootCertStore::empty();
     root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
@@ -26,13 +26,24 @@ fn make_tls_connector() -> MakeRustlsConnect {
     MakeRustlsConnect::new(config)
 }
 
-fn should_use_tls(url: &str) -> bool {
-    // Parse URL to check for sslmode parameter
+pub(crate) fn should_use_tls(url: &str) -> bool {
     if url.contains("sslmode=disable") || url.contains("sslmode=allow") {
         return false;
     }
-    // Default to TLS for external connections, no TLS for localhost
     !url.contains("localhost") && !url.contains("127.0.0.1") && !url.contains("10.200.0.")
+}
+
+/// Rewrite sslmode to a value the Rust postgres crates accept (`require` or `disable`).
+/// Certificate verification is handled by the rustls connector, not the sslmode parameter.
+pub(crate) fn normalize_sslmode(url: &str, use_tls: bool) -> String {
+    let target = if use_tls { "sslmode=require" } else { "sslmode=disable" };
+    if let Some(start) = url.find("sslmode=") {
+        let end = url[start..].find('&').map(|i| start + i).unwrap_or(url.len());
+        format!("{}{}{}", &url[..start], target, &url[end..])
+    } else {
+        let sep = if url.contains('?') { "&" } else { "?" };
+        format!("{}{}{}", url, sep, target)
+    }
 }
 
 pub fn create_pool(database_url: &str) -> DbPool {
@@ -50,9 +61,10 @@ pub fn create_pool(database_url: &str) -> DbPool {
 }
 
 fn establish_connection(url: &str) -> BoxFuture<'_, ConnectionResult<AsyncPgConnection>> {
-    let url = url.to_string();
+    let use_tls = should_use_tls(url);
+    let url = normalize_sslmode(url, use_tls);
     async move {
-        let client = if should_use_tls(&url) {
+        let client = if use_tls {
             let tls = make_tls_connector();
             let (client, conn) = tokio_postgres::connect(&url, tls)
                 .await

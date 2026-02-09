@@ -1,7 +1,9 @@
 use anyhow::{Context, Result};
 use cetane::prelude::*;
-use postgres::{Client, NoTls};
+use postgres::Client;
 use std::cell::RefCell;
+
+use super::{normalize_sslmode, should_use_tls};
 
 pub fn build_registry() -> MigrationRegistry {
     let mut registry = MigrationRegistry::new();
@@ -453,12 +455,22 @@ const LEGACY_MIGRATIONS: &[&str] = &[
     "0005_thumbnail_data",
 ];
 
+fn connect(database_url: &str) -> Result<Client> {
+    let use_tls = should_use_tls(database_url);
+    let url = normalize_sslmode(database_url, use_tls);
+    if use_tls {
+        let tls = super::make_tls_connector();
+        Client::connect(&url, tls).context("Failed to connect to database (TLS)")
+    } else {
+        Client::connect(&url, postgres::NoTls)
+            .context("Failed to connect to database")
+    }
+}
+
 pub fn run_migrations(database_url: &str) -> Result<()> {
-    // Two connections: one for state tracking (held by PostgresMigrationState),
-    // one for executing migration SQL. This avoids double-mutable-borrow issues.
-    let mut state_client = Client::connect(database_url, NoTls)
+    let mut state_client = connect(database_url)
         .context("Failed to connect to database for migration state")?;
-    let exec_client = Client::connect(database_url, NoTls)
+    let exec_client = connect(database_url)
         .context("Failed to connect to database for migration execution")?;
     let exec = RefCell::new(exec_client);
 

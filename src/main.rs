@@ -154,8 +154,7 @@ impl DvrContext {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     dotenvy::dotenv().ok();
 
     tracing_subscriber::fmt()
@@ -167,6 +166,14 @@ async fn main() -> Result<()> {
 
     db::migrations::run_migrations(&database_url)?;
 
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("Failed to build tokio runtime")?
+        .block_on(async_main(cli, database_url))
+}
+
+async fn async_main(cli: Cli, database_url: String) -> Result<()> {
     let pool = db::create_pool(&database_url);
 
     // Canonicalize the base path
@@ -1182,7 +1189,7 @@ async fn transcode_files(
         preset,
         use_hardware,
         audio_codec: "aac".to_string(),
-        container: "mkv".to_string(),
+        container: "ts".to_string(),
     };
 
     let transcoder = Transcoder::new(config);
