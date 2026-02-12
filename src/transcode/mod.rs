@@ -20,7 +20,7 @@ impl Default for TranscodeConfig {
             preset: "medium".to_string(),
             use_hardware: false,
             audio_codec: "aac".to_string(),
-            container: "mkv".to_string(),
+            container: "ts".to_string(),
         }
     }
 }
@@ -86,9 +86,11 @@ impl Transcoder {
             cmd.args(["-t", &format!("{:.3}", end as f64 / 1000.0)]);
         }
 
-        // Video codec
+        cmd.args(["-map", "0"]);
+        cmd.args(["-map_metadata", "0"]);
+        cmd.args(["-map_chapters", "0"]);
+
         if self.config.use_hardware {
-            // Try NVENC first
             cmd.args(["-c:v", "hevc_nvenc", "-preset", "p4", "-cq", &self.config.crf.to_string()]);
         } else {
             cmd.args([
@@ -101,11 +103,13 @@ impl Transcoder {
             ]);
         }
 
-        // Audio codec
         cmd.args(["-c:a", &self.config.audio_codec, "-b:a", "128k"]);
+        cmd.args(["-c:s", "copy"]);
+        cmd.args(["-c:d", "copy"]);
 
         // Output format (needed since .transcoding isn't a known extension)
         let format = match self.config.container.as_str() {
+            "ts" => "mpegts",
             "mkv" => "matroska",
             "mp4" => "mp4",
             "webm" => "webm",
@@ -271,8 +275,10 @@ impl Transcoder {
                 .context("Failed to remove temporary transcoded file")?;
         }
 
-        // Delete original
-        std::fs::remove_file(original).context("Failed to delete original file")?;
+        // Delete original (skip if final_path replaced it in-place)
+        if result.final_path != original {
+            std::fs::remove_file(original).context("Failed to delete original file")?;
+        }
 
         tracing::info!(
             "Finalized: {:?} (saved {} bytes, {:.1}% reduction)",
@@ -335,6 +341,51 @@ impl TranscodeResult {
         } else {
             (1.0 - (self.transcoded_size as f64 / self.original_size as f64)) * 100.0
         }
+    }
+}
+
+/// Extract embedded subtitles to SRT file next to video.
+pub fn extract_subtitles(video_path: &Path) -> Result<Option<PathBuf>> {
+    let srt_path = video_path.with_extension("srt");
+
+    if srt_path.exists() {
+        return Ok(Some(srt_path));
+    }
+
+    let probe = Command::new("ffprobe")
+        .args([
+            "-v", "quiet",
+            "-select_streams", "s",
+            "-show_entries", "stream=index,codec_name",
+            "-of", "json",
+        ])
+        .arg(video_path)
+        .output()
+        .context("Failed to run ffprobe")?;
+
+    let probe_json: serde_json::Value = serde_json::from_slice(&probe.stdout)
+        .unwrap_or(serde_json::json!({"streams": []}));
+
+    let streams = probe_json["streams"].as_array();
+    if streams.map(|s| s.is_empty()).unwrap_or(true) {
+        tracing::debug!("No subtitle streams found in {:?}", video_path);
+        return Ok(None);
+    }
+
+    let output = Command::new("ffmpeg")
+        .args(["-y", "-i"])
+        .arg(video_path)
+        .args(["-map", "0:s:0", "-c:s", "srt"])
+        .arg(&srt_path)
+        .output()
+        .context("Failed to extract subtitles")?;
+
+    if output.status.success() && srt_path.exists() {
+        tracing::info!("Extracted subtitles to {:?}", srt_path);
+        Ok(Some(srt_path))
+    } else {
+        tracing::debug!("Could not extract subtitles from {:?}", video_path);
+        Ok(None)
     }
 }
 
