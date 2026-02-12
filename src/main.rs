@@ -1108,56 +1108,60 @@ async fn transcode_files(
 ) -> Result<()> {
     use dvrreview::transcode::{TranscodeConfig, Transcoder};
 
-    let mut conn = pool.get().await.context("Failed to get database connection")?;
-
     // Clean up any stale .transcoding files and reset their status
-    let stale_files: Vec<File> = files::table
-        .filter(files::dvr_id.eq(ctx.dvr.id))
-        .filter(files::transcode_status.eq(TranscodeStatus::Transcoding))
-        .load(&mut conn)
-        .await?;
-
-    for file in &stale_files {
-        let file_path = match &file.relative_path {
-            Some(rel) => ctx.resolve_path(rel),
-            None => PathBuf::from(&file.path),
-        };
-
-        // Check both the default location (next to original) and temp dir
-        for path in [
-            Transcoder::transcoding_path(&file_path, None),
-            Transcoder::transcoding_path(&file_path, temp_dir.as_deref()),
-        ] {
-            if path.exists() {
-                tracing::info!("Cleaning up stale transcoding file: {:?}", path);
-                let _ = std::fs::remove_file(&path);
-            }
-        }
-
-        diesel::update(files::table.find(file.id))
-            .set(files::transcode_status.eq(TranscodeStatus::Pending))
-            .execute(&mut conn)
+    {
+        let mut conn = pool.get().await.context("Failed to get database connection")?;
+        let stale_files: Vec<File> = files::table
+            .filter(files::dvr_id.eq(ctx.dvr.id))
+            .filter(files::transcode_status.eq(TranscodeStatus::Transcoding))
+            .load(&mut conn)
             .await?;
+
+        for file in &stale_files {
+            let file_path = match &file.relative_path {
+                Some(rel) => ctx.resolve_path(rel),
+                None => PathBuf::from(&file.path),
+            };
+
+            for path in [
+                Transcoder::transcoding_path(&file_path, None),
+                Transcoder::transcoding_path(&file_path, temp_dir.as_deref()),
+            ] {
+                if path.exists() {
+                    tracing::info!("Cleaning up stale transcoding file: {:?}", path);
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+
+            diesel::update(files::table.find(file.id))
+                .set(files::transcode_status.eq(TranscodeStatus::Pending))
+                .execute(&mut conn)
+                .await?;
+        }
     }
 
     // Get files to transcode, ordered by size descending (large first)
-    let mut query = files::table
-        .filter(files::dvr_id.eq(ctx.dvr.id))
-        .filter(files::transcode_status.eq(TranscodeStatus::Pending))
-        .into_boxed();
+    let files_to_transcode: Vec<File> = {
+        let mut conn = pool.get().await.context("Failed to get database connection")?;
+        let mut query = files::table
+            .filter(files::dvr_id.eq(ctx.dvr.id))
+            .filter(files::transcode_status.eq(TranscodeStatus::Pending))
+            .into_boxed();
 
-    if kept_only {
-        query = query.filter(files::status.eq(dvrreview::db::models::FileStatus::Kept));
-    }
+        if kept_only {
+            query = query.filter(files::status.eq(dvrreview::db::models::FileStatus::Kept));
+        }
 
-    let mut files_to_transcode: Vec<File> = query
-        .order(files::size_bytes.desc())
-        .load(&mut conn)
-        .await?;
+        let mut results: Vec<File> = query
+            .order(files::size_bytes.desc())
+            .load(&mut conn)
+            .await?;
 
-    if let Some(max) = limit {
-        files_to_transcode.truncate(max);
-    }
+        if let Some(max) = limit {
+            results.truncate(max);
+        }
+        results
+    };
 
     if files_to_transcode.is_empty() {
         tracing::info!("No files to transcode.");
@@ -1205,6 +1209,7 @@ async fn transcode_files(
 
         if !input_path.exists() {
             tracing::warn!("File not found, skipping: {:?}", input_path);
+            let mut conn = pool.get().await.context("Failed to get database connection")?;
             diesel::update(files::table.find(file.id))
                 .set(files::transcode_status.eq(TranscodeStatus::Failed))
                 .execute(&mut conn)
@@ -1220,16 +1225,30 @@ async fn transcode_files(
             file.size_bytes as f64 / 1_000_000_000.0
         );
 
-        diesel::update(files::table.find(file.id))
-            .set(files::transcode_status.eq(TranscodeStatus::Transcoding))
-            .execute(&mut conn)
-            .await?;
+        let unknown_streams = dvrreview::transcode::probe_unknown_streams(&input_path)
+            .unwrap_or_default();
+        let preserve_original = !unknown_streams.is_empty();
+        if preserve_original {
+            let names: Vec<_> = unknown_streams.iter()
+                .map(|s| format!("#{} ({})", s.index, s.codec))
+                .collect();
+            tracing::info!("Unknown streams detected, will preserve original: {}", names.join(", "));
+        }
+
+        {
+            let mut conn = pool.get().await.context("Failed to get database connection")?;
+            diesel::update(files::table.find(file.id))
+                .set(files::transcode_status.eq(TranscodeStatus::Transcoding))
+                .execute(&mut conn)
+                .await?;
+        }
 
         let result = match transcoder.transcode(&input_path, file.content_start_ms, file.content_end_ms, temp_dir.as_deref()) {
             Ok(r) => r,
             Err(e) => {
                 tracing::error!("Transcode failed: {}", e);
                 transcoder.cleanup_failed(&Transcoder::transcoding_path(&input_path, temp_dir.as_deref())).ok();
+                let mut conn = pool.get().await.context("Failed to get database connection")?;
                 diesel::update(files::table.find(file.id))
                     .set(files::transcode_status.eq(TranscodeStatus::Failed))
                     .execute(&mut conn)
@@ -1240,10 +1259,13 @@ async fn transcode_files(
         };
 
         if verify {
-            diesel::update(files::table.find(file.id))
-                .set(files::transcode_status.eq(TranscodeStatus::Verifying))
-                .execute(&mut conn)
-                .await?;
+            {
+                let mut conn = pool.get().await.context("Failed to get database connection")?;
+                diesel::update(files::table.find(file.id))
+                    .set(files::transcode_status.eq(TranscodeStatus::Verifying))
+                    .execute(&mut conn)
+                    .await?;
+            }
 
             match transcoder.verify(&input_path, &result.transcoding_path) {
                 Ok(v) if v.passed => {
@@ -1252,6 +1274,7 @@ async fn transcode_files(
                 Ok(v) => {
                     tracing::error!("{}", v.message);
                     transcoder.cleanup_failed(&result.transcoding_path).ok();
+                    let mut conn = pool.get().await.context("Failed to get database connection")?;
                     diesel::update(files::table.find(file.id))
                         .set(files::transcode_status.eq(TranscodeStatus::Failed))
                         .execute(&mut conn)
@@ -1262,6 +1285,7 @@ async fn transcode_files(
                 Err(e) => {
                     tracing::error!("Verification error: {}", e);
                     transcoder.cleanup_failed(&result.transcoding_path).ok();
+                    let mut conn = pool.get().await.context("Failed to get database connection")?;
                     diesel::update(files::table.find(file.id))
                         .set(files::transcode_status.eq(TranscodeStatus::Failed))
                         .execute(&mut conn)
@@ -1272,8 +1296,9 @@ async fn transcode_files(
             }
         }
 
-        if let Err(e) = transcoder.finalize(&result, &input_path) {
+        if let Err(e) = transcoder.finalize(&result, &input_path, preserve_original) {
             tracing::error!("Finalize failed: {}", e);
+            let mut conn = pool.get().await.context("Failed to get database connection")?;
             diesel::update(files::table.find(file.id))
                 .set(files::transcode_status.eq(TranscodeStatus::Failed))
                 .execute(&mut conn)
@@ -1282,9 +1307,9 @@ async fn transcode_files(
             continue;
         }
 
-        // Update both absolute and relative paths to new file
         let new_relative = ctx.make_relative(&result.final_path).ok();
 
+        let mut conn = pool.get().await.context("Failed to get database connection")?;
         diesel::update(files::table.find(file.id))
             .set((
                 files::transcode_status.eq(TranscodeStatus::Completed),

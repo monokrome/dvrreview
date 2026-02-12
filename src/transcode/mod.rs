@@ -4,6 +4,43 @@ use std::process::Command;
 
 use crate::scanner::fingerprint::Fingerprinter;
 
+#[derive(Debug)]
+pub struct UnknownStream {
+    pub index: usize,
+    pub codec: String,
+}
+
+pub fn probe_unknown_streams(path: &Path) -> Result<Vec<UnknownStream>> {
+    let output = Command::new("ffprobe")
+        .args([
+            "-v", "quiet",
+            "-show_entries", "stream=index,codec_name,codec_type",
+            "-of", "json",
+        ])
+        .arg(path)
+        .output()
+        .context("Failed to run ffprobe")?;
+
+    let probe: serde_json::Value =
+        serde_json::from_slice(&output.stdout).context("Failed to parse ffprobe output")?;
+
+    let streams = probe["streams"].as_array();
+    let mut unknown = Vec::new();
+
+    if let Some(streams) = streams {
+        for stream in streams {
+            let codec_type = stream["codec_type"].as_str().unwrap_or("");
+            if codec_type == "unknown" || codec_type == "" {
+                let index = stream["index"].as_u64().unwrap_or(0) as usize;
+                let codec = stream["codec_name"].as_str().unwrap_or("none").to_string();
+                unknown.push(UnknownStream { index, codec });
+            }
+        }
+    }
+
+    Ok(unknown)
+}
+
 #[derive(Debug, Clone)]
 pub struct TranscodeConfig {
     pub crf: u8,
@@ -86,7 +123,7 @@ impl Transcoder {
             cmd.args(["-t", &format!("{:.3}", end as f64 / 1000.0)]);
         }
 
-        cmd.args(["-map", "0"]);
+        cmd.args(["-map", "0", "-ignore_unknown"]);
         cmd.args(["-map_metadata", "0"]);
         cmd.args(["-map_chapters", "0"]);
 
@@ -243,8 +280,20 @@ impl Transcoder {
         })
     }
 
-    pub fn finalize(&self, result: &TranscodeResult, original: &Path) -> Result<()> {
-        // Move transcoding file to final name (try rename, fall back to copy+delete for cross-filesystem)
+    pub fn finalize(&self, result: &TranscodeResult, original: &Path, preserve_original: bool) -> Result<()> {
+        if preserve_original && result.final_path == original {
+            // Original and output share the same path but we need to keep the original.
+            // Rename original to .original.ts, then move transcoded file into place.
+            let mut preserved = original.to_path_buf();
+            let stem = original.file_stem().unwrap_or_default().to_string_lossy();
+            let ext = original.extension().unwrap_or_default().to_string_lossy();
+            preserved.set_file_name(format!("{}.original.{}", stem, ext));
+
+            std::fs::rename(original, &preserved)
+                .with_context(|| format!("Failed to preserve original as {:?}", preserved))?;
+            tracing::info!("Preserved original with unknown streams as {:?}", preserved);
+        }
+
         if let Err(rename_err) = std::fs::rename(&result.transcoding_path, &result.final_path) {
             tracing::debug!(
                 "Rename failed ({}), falling back to copy+delete with integrity check",
@@ -275,8 +324,7 @@ impl Transcoder {
                 .context("Failed to remove temporary transcoded file")?;
         }
 
-        // Delete original (skip if final_path replaced it in-place)
-        if result.final_path != original {
+        if !preserve_original && result.final_path != original {
             std::fs::remove_file(original).context("Failed to delete original file")?;
         }
 
